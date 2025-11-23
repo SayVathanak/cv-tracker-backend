@@ -13,15 +13,12 @@ import os
 import shutil
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-import platform # <--- IMPORTANT: Needed to detect OS
+import platform # <--- IMPORTANT
 
-# --- CONFIGURATION (SMART CHECK) ---
-# Check if we are on Windows or Linux (Cloud)
+# --- CONFIGURATION ---
 if platform.system() == "Windows":
-    # Your local path
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 else:
-    # Cloud path (Linux installs it in default location)
     print("Running on Linux/Cloud - using default Tesseract path")
 
 # --- CREATE UPLOAD FOLDER ---
@@ -30,6 +27,7 @@ if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
 # --- DATABASE SETUP ---
+# ⚠️ REPLACE WITH YOUR REAL CONNECTION STRING
 MONGO_URL = "mongodb+srv://saksovathanaksay_db_user:Vathanak99@cluster0.pt9gimf.mongodb.net/?appName=Cluster0"
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.cv_tracking_db
@@ -40,13 +38,13 @@ app = FastAPI()
 # --- MIDDLEWARE ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- SERVE STATIC FILES (For Preview) ---
+# --- SERVE STATIC FILES ---
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
 
 # --- TEXT EXTRACTION ---
@@ -121,11 +119,7 @@ async def upload_cv(files: List[UploadFile] = File(...)):
         try:
             # 1. SAVE FILE TO DISK
             file_location = f"{UPLOAD_DIR}/{file.filename}"
-            
-            # Read content once
             content = await file.read()
-            
-            # Write content to disk
             with open(file_location, "wb+") as file_object:
                 file_object.write(content)
 
