@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles # <--- NEW: Needed for Preview
+from fastapi.staticfiles import StaticFiles
+from typing import List
 import pdfplumber
 import docx
 import pytesseract
@@ -8,23 +9,22 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import io
 import re
-import os       # <--- NEW: To manage folders
-import shutil   # <--- NEW: To save files
+import os
+import shutil
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from typing import List
-import platform
+import platform # <--- IMPORTANT: Needed to detect OS
 
-# --- CONFIGURATION ---
-# Smartly detect OS: Windows vs Linux (Cloud)
+# --- CONFIGURATION (SMART CHECK) ---
+# Check if we are on Windows or Linux (Cloud)
 if platform.system() == "Windows":
+    # Your local path
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 else:
-    # On Cloud (Linux), Tesseract is installed in the system path automatically
+    # Cloud path (Linux installs it in default location)
     print("Running on Linux/Cloud - using default Tesseract path")
 
 # --- CREATE UPLOAD FOLDER ---
-# This creates a folder named "static_uploads" to keep PDF/Images safe
 UPLOAD_DIR = "static_uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
@@ -40,14 +40,13 @@ app = FastAPI()
 # --- MIDDLEWARE ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- MOUNT STATIC FILES ---
-# This allows the Frontend to access http://.../static/cv.pdf
+# --- SERVE STATIC FILES (For Preview) ---
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
 
 # --- TEXT EXTRACTION ---
@@ -120,7 +119,7 @@ async def upload_cv(files: List[UploadFile] = File(...)):
     results = []
     for file in files:
         try:
-            # 1. SAVE FILE TO DISK (Crucial for Preview)
+            # 1. SAVE FILE TO DISK
             file_location = f"{UPLOAD_DIR}/{file.filename}"
             
             # Read content once
