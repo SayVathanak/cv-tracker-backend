@@ -1,7 +1,8 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from typing import List
+import cloudinary
+import cloudinary.uploader
 import pdfplumber
 import docx
 import pytesseract
@@ -9,11 +10,12 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import io
 import re
-import os
-import shutil
+import platform
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-import platform # <--- IMPORTANT
+from datetime import datetime
+import httpx
+from fastapi.responses import Response
 
 # --- CONFIGURATION ---
 if platform.system() == "Windows":
@@ -21,13 +23,15 @@ if platform.system() == "Windows":
 else:
     print("Running on Linux/Cloud - using default Tesseract path")
 
-# --- CREATE UPLOAD FOLDER ---
-UPLOAD_DIR = "static_uploads"
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+# --- CLOUDINARY SETUP (REPLACE WITH YOUR KEYS) ---
+cloudinary.config( 
+  cloud_name = "dsy9bfpre", 
+  api_key = "973775943389468", 
+  api_secret = "MW6-sD1o_2ck4-XTHIeoH8qEXO4",
+  secure = True
+)
 
 # --- DATABASE SETUP ---
-# ⚠️ REPLACE WITH YOUR REAL CONNECTION STRING
 MONGO_URL = "mongodb+srv://saksovathanaksay_db_user:Vathanak99@cluster0.pt9gimf.mongodb.net/?appName=Cluster0"
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.cv_tracking_db
@@ -35,17 +39,13 @@ collection = db.candidates
 
 app = FastAPI()
 
-# --- MIDDLEWARE ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- SERVE STATIC FILES ---
-app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
 
 # --- TEXT EXTRACTION ---
 def extract_text(file_bytes: bytes, filename: str) -> str:
@@ -73,41 +73,66 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 # --- PARSING LOGIC ---
 def parse_cv_text(text: str) -> dict:
-    data = {"Name": "N/A", "Birth": "N/A", "Tel": "N/A", "Location": "N/A", "School": "N/A", "Experience": "N/A"}
+    data = {
+        "Name": "N/A", "Birth": "N/A", "Tel": "N/A", "Email": "N/A",
+        "Location": "N/A", "School": "N/A", "Experience": "N/A",
+        "Skills": "N/A", "Education_Level": "N/A"
+    }
     
-    name_match = re.search(r"(?:Name|ឈ្មោះ)[\s.:]*([^\n]+)", text, re.IGNORECASE)
-    if name_match:
-        data["Name"] = name_match.group(1).replace("Address", "").strip().lstrip(". ")
-    else:
+    text_normalized = re.sub(r'\s+', ' ', text)
+    
+    # 1. NAME
+    name_patterns = [
+        r"(?:Full\s*)?Name[\s:.-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)",
+        r"(?:ឈ្មោះ|Name)[\s:.-]*([^\n\d]+?)(?:\n|Address|Date)",
+    ]
+    for pattern in name_patterns:
+        name_match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if name_match:
+            name = name_match.group(1).strip()
+            if len(name) > 3 and len(name) < 50 and not any(w in name.lower() for w in ['resume', 'curriculum']):
+                data["Name"] = name
+                break
+    if data["Name"] == "N/A":
         lines = [line.strip() for line in text.split('\n') if line.strip()]
-        if lines:
-            if "resume" not in lines[0].lower(): data["Name"] = lines[0]
+        if lines and "resume" not in lines[0].lower(): data["Name"] = lines[0]
 
-    phone_match = re.search(r"\(?\+?\d{1,4}\)?[\s-]?\d{2,4}[\s-]?\d{2,4}[\s-]?\d{0,4}", text)
-    if phone_match and len(phone_match.group(0)) > 8: data["Tel"] = phone_match.group(0).strip()
+    # 2. EMAIL
+    email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+    if email_match: data["Email"] = email_match.group(0).strip()
 
-    dob_match = re.search(r"(?:Birth|DOB).*?(\d{1,2}[\s/-]+[A-Za-z0-9]+[\s/-]+\d{4})", text, re.IGNORECASE)
-    if dob_match: data["Birth"] = dob_match.group(1).strip()
+    # 3. PHONE
+    phone_patterns = [r'\+855[\s-]?\d{1,2}[\s-]?\d{3}[\s-]?\d{3,4}', r'0\d{1,2}[\s-]?\d{3}[\s-]?\d{3,4}']
+    for pattern in phone_patterns:
+        phone_match = re.search(pattern, text)
+        if phone_match and len(re.sub(r'\D', '', phone_match.group(0))) >= 8:
+            data["Tel"] = phone_match.group(0).strip(); break
 
-    loc_label = re.search(r"(?:Address|Location).*?([A-Za-z0-9\s,]+(?:Province|City|Street|Road|Village|Commune))", text, re.IGNORECASE | re.DOTALL)
-    if loc_label:
-        data["Location"] = loc_label.group(1).replace("\n", " ").strip()
-    else:
-        cambodia_geo = re.search(r"([A-Za-z0-9\s,\-]+(?:Commune|Sangkat|District|Khan|Phnom Penh|Province|Kandal|Siem Reap))", text, re.IGNORECASE)
-        if cambodia_geo: data["Location"] = cambodia_geo.group(1).replace("\n", " ").strip()
+    # 4. BIRTH DATE
+    # Updated regex to handle "June 08th, 2004"
+    dob_match = re.search(r"(?:Birth|DOB).*?(\d{1,2}[-/thstndrd\s]+[A-Za-z0-9]+[-/,\s]+\d{4}|[A-Za-z]+\s+\d{1,2}[thstndrd,]*\s+\d{4})", text, re.IGNORECASE | re.DOTALL)
+    if dob_match: 
+        data["Birth"] = dob_match.group(1).replace('\n', ' ').strip()
 
-    school_match = re.search(r"(?:at|from)?\s*([A-Za-z\s&]+(?:Institute|University|College|High School))", text, re.IGNORECASE)
-    if school_match: data["School"] = re.sub(r'\d+', '', school_match.group(1).replace("\n", " ").strip()).strip()
+    # 5. LOCATION
+    loc_match = re.search(r'(?:Address|Location)[\s:.-]*(.*?(?:Province|City|Street|Phnom\s*Penh))', text, re.IGNORECASE | re.DOTALL)
+    if loc_match: data["Location"] = loc_match.group(1).replace("\n", " ").strip()
 
-    exp_match = re.search(r"(?:Work Experience|History|Employment|Experiences)(.*?)(?:Education|Skills|Language|Reference|Personal|Marital|Ma\s*rital|Sex|Nationality|Address|Religion|Health|Height|Hobbies|$)", text, re.IGNORECASE | re.DOTALL)
+    # 6. EDUCATION
+    school_match = re.search(r'([A-Za-z\s&]+(?:University|Institute|College|High\s*School))', text, re.IGNORECASE)
+    if school_match: data["School"] = re.sub(r'\d+', '', school_match.group(1).strip())
+
+    # 7. EXPERIENCE
+    exp_match = re.search(r'(?:Work\s*Experience|History)(.*?)(?=\n(?:Education|Skills|Reference|$))', text, re.IGNORECASE | re.DOTALL)
     if exp_match:
         raw_exp = exp_match.group(1).strip()
-        if re.search(r"^[:\-\s]*(No|None|N/A)", raw_exp, re.IGNORECASE):
-            data["Experience"] = "No Experience Listed"
-        elif len(raw_exp) > 5:
-            clean_exp = re.split(r"(?:Religion|Health|Height|Hobbies|Marital|Ma\s*rital)", raw_exp, flags=re.IGNORECASE)[0]
-            data["Experience"] = clean_exp[:50].lstrip(":.- ") + "..."
-    
+        if len(raw_exp) > 10: data["Experience"] = raw_exp[:200] + "..."
+
+    # 8. SKILLS
+    skills_match = re.search(r'(?:Skills)(.*?)(?=\n(?:Experience|Education|$))', text, re.IGNORECASE | re.DOTALL)
+    if skills_match:
+        data["Skills"] = skills_match.group(1).strip()[:100]
+
     return data
 
 # --- API ENDPOINTS ---
@@ -117,42 +142,83 @@ async def upload_cv(files: List[UploadFile] = File(...)):
     results = []
     for file in files:
         try:
-            # 1. SAVE FILE TO DISK
-            file_location = f"{UPLOAD_DIR}/{file.filename}"
+            # 1. Read content for OCR
             content = await file.read()
-            with open(file_location, "wb+") as file_object:
-                file_object.write(content)
+            
+            # 2. UPLOAD TO CLOUDINARY
+            # This sends the file to Cloudinary and gets a permanent URL back
+            upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=file.filename.split('.')[0])
+            cv_url = upload_result.get("secure_url")
 
-            # 2. Extract & Parse
+            # 3. Extract & Parse
             raw_text = extract_text(content, file.filename)
             structured_data = parse_cv_text(raw_text)
-            structured_data["file_name"] = file.filename
             
-            # 3. Database Upsert
-            existing = await collection.find_one({"Name": structured_data["Name"], "Tel": structured_data["Tel"]})
+            structured_data["file_name"] = file.filename
+            structured_data["cv_url"] = cv_url  # <--- SAVE THE URL, NOT THE FILE
+            structured_data["upload_date"] = datetime.now().isoformat()
+            
+            # 4. Database Upsert
+            query = {"Name": structured_data["Name"], "Tel": structured_data["Tel"]}
+            if structured_data["Email"] != "N/A":
+                query = {"$or": [query, {"Email": structured_data["Email"]}]}
+
+            existing = await collection.find_one(query)
+            
             if existing:
                 await collection.update_one({"_id": existing["_id"]}, {"$set": structured_data})
                 status = "Updated"
+                structured_data["_id"] = str(existing["_id"])
             else:
-                await collection.insert_one(structured_data)
-                status = "Saved"
+                result = await collection.insert_one(structured_data)
+                status = "Created"
+                structured_data["_id"] = str(result.inserted_id)
             
-            if "_id" in structured_data: structured_data["_id"] = str(structured_data["_id"])
             results.append(structured_data)
             
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error processing {file.filename}: {e}")
             results.append({"filename": file.filename, "status": f"Error: {str(e)}"})
 
-    return {"status": f"Batch Processed {len(results)} files", "details": results}
+    return {"status": f"Processed {len(results)} files", "details": results}
 
 @app.get("/candidates")
 async def get_candidates():
     candidates = []
-    async for candidate in collection.find():
+    async for candidate in collection.find().sort("upload_date", -1):
         candidate["_id"] = str(candidate["_id"])
         candidates.append(candidate)
     return candidates
+
+@app.get("/cv/{candidate_id}")
+async def get_candidate_cv(candidate_id: str):
+    try:
+        obj_id = ObjectId(candidate_id)
+        candidate = await collection.find_one({"_id": obj_id})
+
+        if not candidate or "cv_url" not in candidate:
+            return Response(content="CV not found", status_code=404)
+
+        cv_url = candidate["cv_url"]
+        
+        # Use httpx to fetch the file from the external Cloudinary URL
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(cv_url)
+            response.raise_for_status() # Raise an exception for 4xx or 5xx status codes
+
+        # Return the file content with the correct MIME type
+        content_type = response.headers.get("Content-Type", "application/pdf")
+        
+        # FastAPI's CORS middleware will automatically add the necessary 
+        # Access-Control-Allow-Origin: * header to this response.
+        return Response(content=response.content, media_type=content_type)
+        
+    except httpx.HTTPStatusError as e:
+        print(f"Error fetching file from Cloudinary: {e}")
+        return Response(content="Error fetching file from Cloudinary", status_code=500)
+    except Exception as e:
+        print(f"Internal error: {e}")
+        return Response(content=f"Internal error: {e}", status_code=500)
 
 @app.delete("/candidates/{candidate_id}")
 async def delete_candidate(candidate_id: str):
@@ -168,7 +234,9 @@ async def update_candidate(candidate_id: str, updated_data: dict):
     try:
         obj_id = ObjectId(candidate_id)
         if "_id" in updated_data: del updated_data["_id"]
+        updated_data["last_modified"] = datetime.now().isoformat()
         await collection.update_one({"_id": obj_id}, {"$set": updated_data})
         return {"status": "Updated successfully"}
     except Exception as e:
         return {"status": f"Error: {e}"}
+    
