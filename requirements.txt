@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+pdfplumber
+python-docx
+pytesseract
+pdf2image
+Pillow
+motor
+dnspython
