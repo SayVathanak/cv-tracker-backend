@@ -13,9 +13,15 @@ import shutil   # <--- NEW: To save files
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from typing import List
+import platform
 
 # --- CONFIGURATION ---
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Smartly detect OS: Windows vs Linux (Cloud)
+if platform.system() == "Windows":
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+else:
+    # On Cloud (Linux), Tesseract is installed in the system path automatically
+    print("Running on Linux/Cloud - using default Tesseract path")
 
 # --- CREATE UPLOAD FOLDER ---
 # This creates a folder named "static_uploads" to keep PDF/Images safe
