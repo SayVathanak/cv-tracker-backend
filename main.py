@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
+from pydantic import BaseModel
 import cloudinary
 import cloudinary.uploader
 import pdfplumber
@@ -23,7 +24,7 @@ if platform.system() == "Windows":
 else:
     print("Running on Linux/Cloud - using default Tesseract path")
 
-# --- CLOUDINARY SETUP (REPLACE WITH YOUR KEYS) ---
+# --- CLOUDINARY SETUP ---
 cloudinary.config( 
   cloud_name = "dsy9bfpre", 
   api_key = "973775943389468", 
@@ -56,8 +57,9 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
                     extract = page.extract_text()
-                    if extract: text += extract + "\n"
-            if len(text) < 50:
+                    if extract: 
+                        text += extract + "\n"
+            if len(text.strip()) < 50:
                 images = convert_from_bytes(file_bytes)
                 for img in images:
                     text += pytesseract.image_to_string(img, lang='khm+eng')
@@ -71,67 +73,88 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
         print(f"Error reading file: {e}")
     return text
 
-# --- PARSING LOGIC ---
+# --- IMPROVED PARSING LOGIC ---
 def parse_cv_text(text: str) -> dict:
+    # 1. Initialization (Removed Email and Skills)
     data = {
-        "Name": "N/A", "Birth": "N/A", "Tel": "N/A", "Email": "N/A",
+        "Name": "N/A", "Birth": "N/A", "Tel": "N/A",
         "Location": "N/A", "School": "N/A", "Experience": "N/A",
-        "Skills": "N/A", "Education_Level": "N/A"
+        "Gender": "N/A"
     }
     
     text_normalized = re.sub(r'\s+', ' ', text)
     
-    # 1. NAME
+    # 2. NAME EXTRACTION
+    best_name = ""
     name_patterns = [
-        r"(?:Full\s*)?Name[\s:.-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)",
-        r"(?:ឈ្មោះ|Name)[\s:.-]*([^\n\d]+?)(?:\n|Address|Date)",
+        r"(?:Name|Full\s*Name)[\s:.-]*([A-Z][a-zA-Z\s]{2,50}?)(?=\n|Address|Date|Tel|Contact|Mobile|$)",
+        r"^([A-Z][a-zA-Z\s]{2,40})\n",
     ]
     for pattern in name_patterns:
         name_match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if name_match:
             name = name_match.group(1).strip()
-            if len(name) > 3 and len(name) < 50 and not any(w in name.lower() for w in ['resume', 'curriculum']):
-                data["Name"] = name
+            exclude = ['resume', 'curriculum', 'contact', 'vitae', 'apply', 'summary', 'profile']
+            if len(name) > 3 and not any(w in name.lower() for w in exclude) and not re.search(r'\d', name):
+                best_name = name.split('\n')[0].strip()
                 break
-    if data["Name"] == "N/A":
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        if lines and "resume" not in lines[0].lower(): data["Name"] = lines[0]
+    if not best_name:
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        if lines and len(lines[0]) < 50 and "resume" not in lines[0].lower():
+            best_name = lines[0]
+    data["Name"] = best_name if best_name else "N/A"
 
-    # 2. EMAIL
-    email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
-    if email_match: data["Email"] = email_match.group(0).strip()
-
-    # 3. PHONE
-    phone_patterns = [r'\+855[\s-]?\d{1,2}[\s-]?\d{3}[\s-]?\d{3,4}', r'0\d{1,2}[\s-]?\d{3}[\s-]?\d{3,4}']
-    for pattern in phone_patterns:
-        phone_match = re.search(pattern, text)
-        if phone_match and len(re.sub(r'\D', '', phone_match.group(0))) >= 8:
-            data["Tel"] = phone_match.group(0).strip(); break
+    # 3. PHONE (Includes fix for spaced numbers like 096 51 35 387)
+    phone_match = re.search(r'(?:\+855|0)(?:[\s-]*\d){8,11}', text)
+    if phone_match:
+        digits = re.sub(r'\D', '', phone_match.group(0))
+        if digits.startswith('855'): digits = '0' + digits[3:]
+        data["Tel"] = digits[:10]
 
     # 4. BIRTH DATE
-    # Updated regex to handle "June 08th, 2004"
-    dob_match = re.search(r"(?:Birth|DOB).*?(\d{1,2}[-/thstndrd\s]+[A-Za-z0-9]+[-/,\s]+\d{4}|[A-Za-z]+\s+\d{1,2}[thstndrd,]*\s+\d{4})", text, re.IGNORECASE | re.DOTALL)
-    if dob_match: 
-        data["Birth"] = dob_match.group(1).replace('\n', ' ').strip()
+    dob_match = re.search(r"(?:Birth|DOB).*?(\d{1,2}[-/\s\.]\d{1,2}[-/\s\.]\d{2,4})", text, re.IGNORECASE | re.DOTALL)
+    if dob_match: data["Birth"] = dob_match.group(1).replace('\n', '').strip()
 
     # 5. LOCATION
-    loc_match = re.search(r'(?:Address|Location)[\s:.-]*(.*?(?:Province|City|Street|Phnom\s*Penh))', text, re.IGNORECASE | re.DOTALL)
-    if loc_match: data["Location"] = loc_match.group(1).replace("\n", " ").strip()
+    loc_match = re.search(r'(?:Address|Location)[\s:.-]*([^\n]{5,100})', text, re.IGNORECASE)
+    if loc_match: data["Location"] = loc_match.group(1).strip()[:100]
 
-    # 6. EDUCATION
-    school_match = re.search(r'([A-Za-z\s&]+(?:University|Institute|College|High\s*School))', text, re.IGNORECASE)
-    if school_match: data["School"] = re.sub(r'\d+', '', school_match.group(1).strip())
+    # 6. SCHOOL
+    school_match = re.search(r'([A-Z][A-Za-z\s&-]+(?:University|Institute|High\s*School))', text)
+    if school_match: data["School"] = school_match.group(1).strip()
 
-    # 7. EXPERIENCE
-    exp_match = re.search(r'(?:Work\s*Experience|History)(.*?)(?=\n(?:Education|Skills|Reference|$))', text, re.IGNORECASE | re.DOTALL)
-    if exp_match:
-        raw_exp = exp_match.group(1).strip()
-        if len(raw_exp) > 10: data["Experience"] = raw_exp[:200] + "..."
-
-    # 8. SKILLS
-    skills_match = re.search(r'(?:Skills)(.*?)(?=\n(?:Experience|Education|$))', text, re.IGNORECASE | re.DOTALL)
-    if skills_match:
-        data["Skills"] = skills_match.group(1).strip()[:100]
+    # 7. EXPERIENCE (Fixed to stop at Languages/Personalities)
+    exp_match = re.search(
+        r'(?:WORK\s+)?(?:EXPERIENCE|EMPLOYMENT|HISTORY)[\s:.-]*'  # Start looking here
+        r'(.*?)'                                                   # Capture content
+        r'(?=\n(?:EDUCATION|SKILLS|REFERENCE|LANGUAGES?|PERSONALITIES|INTEREST|DECLARATION|CERTIF|$))', # STOP here
+        text, 
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    if exp_match: 
+        raw = re.sub(r'\s+', ' ', exp_match.group(1)).strip()
+        # Clean up specific noise seen in your screenshot (like "S: . |")
+        raw = re.sub(r'^[|:.\s]*', '', raw) 
+        data["Experience"] = raw[:350] + ("..." if len(raw) > 350 else "")
+        
+    # 8. GENDER (Robust Fallback)
+    found_gender = False
+    explicit_match = re.search(r'\b(?:Gender|Sex)[\s:.-]*([A-Za-z]+)\b', text, re.IGNORECASE)
+    if explicit_match:
+        val = explicit_match.group(1).lower()
+        if 'female' in val or 'f' == val: 
+            data["Gender"] = "Female"
+            found_gender = True
+        elif 'male' in val or 'm' == val: 
+            data["Gender"] = "Male"
+            found_gender = True
+            
+    if not found_gender:
+        if re.search(r'\bFemale\b', text, re.IGNORECASE):
+            data["Gender"] = "Female"
+        elif re.search(r'\bMale\b', text, re.IGNORECASE):
+            data["Gender"] = "Male"
 
     return data
 
@@ -142,31 +165,32 @@ async def upload_cv(files: List[UploadFile] = File(...)):
     results = []
     for file in files:
         try:
-            # 1. Read content for OCR
             content = await file.read()
             
-            # 2. UPLOAD TO CLOUDINARY
-            # This sends the file to Cloudinary and gets a permanent URL back
-            upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=file.filename.split('.')[0])
+            upload_result = cloudinary.uploader.upload(
+                content, 
+                resource_type="auto", 
+                public_id=file.filename.split('.')[0]
+            )
             cv_url = upload_result.get("secure_url")
 
-            # 3. Extract & Parse
             raw_text = extract_text(content, file.filename)
             structured_data = parse_cv_text(raw_text)
             
             structured_data["file_name"] = file.filename
-            structured_data["cv_url"] = cv_url  # <--- SAVE THE URL, NOT THE FILE
+            structured_data["cv_url"] = cv_url
             structured_data["upload_date"] = datetime.now().isoformat()
+            structured_data["locked"] = False
             
-            # 4. Database Upsert
             query = {"Name": structured_data["Name"], "Tel": structured_data["Tel"]}
-            if structured_data["Email"] != "N/A":
-                query = {"$or": [query, {"Email": structured_data["Email"]}]}
-
+            
             existing = await collection.find_one(query)
             
             if existing:
-                await collection.update_one({"_id": existing["_id"]}, {"$set": structured_data})
+                await collection.update_one(
+                    {"_id": existing["_id"]}, 
+                    {"$set": structured_data}
+                )
                 status = "Updated"
                 structured_data["_id"] = str(existing["_id"])
             else:
@@ -201,16 +225,11 @@ async def get_candidate_cv(candidate_id: str):
 
         cv_url = candidate["cv_url"]
         
-        # Use httpx to fetch the file from the external Cloudinary URL
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(cv_url)
-            response.raise_for_status() # Raise an exception for 4xx or 5xx status codes
+            response.raise_for_status()
 
-        # Return the file content with the correct MIME type
         content_type = response.headers.get("Content-Type", "application/pdf")
-        
-        # FastAPI's CORS middleware will automatically add the necessary 
-        # Access-Control-Allow-Origin: * header to this response.
         return Response(content=response.content, media_type=content_type)
         
     except httpx.HTTPStatusError as e:
@@ -224,8 +243,67 @@ async def get_candidate_cv(candidate_id: str):
 async def delete_candidate(candidate_id: str):
     try:
         obj_id = ObjectId(candidate_id)
+        candidate = await collection.find_one({"_id": obj_id})
+        if candidate and candidate.get("locked", False):
+            return {"status": "Error: Candidate is locked"}
+        
         await collection.delete_one({"_id": obj_id})
         return {"status": "Deleted successfully"}
+    except Exception as e:
+        return {"status": f"Error: {e}"}
+
+class BulkDeleteRequest(BaseModel):
+    candidate_ids: List[str]
+    passcode: str = None
+
+@app.post("/candidates/bulk-delete")
+async def delete_bulk_candidates(request: BulkDeleteRequest):
+    try:
+        # Check if this is a "delete all" request (empty list means delete all)
+        is_delete_all = len(request.candidate_ids) == 0
+        
+        # If deleting all, require passcode
+        if is_delete_all:
+            if request.passcode != "9994":
+                return {
+                    "status": "error",
+                    "message": "Invalid passcode. Passcode required to delete all candidates."
+                }
+        
+        deleted_count = 0
+        skipped = []
+        
+        # Get candidates to delete
+        if is_delete_all:
+            # Delete all unlocked candidates
+            candidates_cursor = collection.find({"locked": {"$ne": True}})
+            async for candidate in candidates_cursor:
+                await collection.delete_one({"_id": candidate["_id"]})
+                deleted_count += 1
+            
+            # Count skipped (locked) candidates
+            skipped_count = await collection.count_documents({"locked": True})
+        else:
+            # Delete specific candidates
+            for cid in request.candidate_ids:
+                obj_id = ObjectId(cid)
+                candidate = await collection.find_one({"_id": obj_id})
+                
+                if candidate and candidate.get("locked", False):
+                    skipped.append(cid)
+                    continue
+                
+                await collection.delete_one({"_id": obj_id})
+                deleted_count += 1
+            
+            skipped_count = len(skipped)
+        
+        return {
+            "status": "success",
+            "deleted": deleted_count,
+            "skipped": skipped_count,
+            "skipped_ids": skipped if not is_delete_all else []
+        }
     except Exception as e:
         return {"status": f"Error: {e}"}
 
@@ -233,10 +311,23 @@ async def delete_candidate(candidate_id: str):
 async def update_candidate(candidate_id: str, updated_data: dict):
     try:
         obj_id = ObjectId(candidate_id)
-        if "_id" in updated_data: del updated_data["_id"]
+        if "_id" in updated_data:
+            del updated_data["_id"]
         updated_data["last_modified"] = datetime.now().isoformat()
         await collection.update_one({"_id": obj_id}, {"$set": updated_data})
         return {"status": "Updated successfully"}
     except Exception as e:
         return {"status": f"Error: {e}"}
-    
+
+@app.put("/candidates/{candidate_id}/lock")
+async def toggle_lock(candidate_id: str, request: dict):
+    try:
+        obj_id = ObjectId(candidate_id)
+        locked = request.get("locked", False)
+        await collection.update_one(
+            {"_id": obj_id}, 
+            {"$set": {"locked": locked}}
+        )
+        return {"status": "success", "locked": locked}
+    except Exception as e:
+        return {"status": f"Error: {e}"}
