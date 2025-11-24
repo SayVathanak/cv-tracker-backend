@@ -75,7 +75,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 # --- IMPROVED PARSING LOGIC ---
 def parse_cv_text(text: str) -> dict:
-    # 1. Initialization (Removed Email and Skills)
+    # 1. Initialization
     data = {
         "Name": "N/A", "Birth": "N/A", "Tel": "N/A",
         "Location": "N/A", "School": "N/A", "Experience": "N/A",
@@ -83,6 +83,7 @@ def parse_cv_text(text: str) -> dict:
     }
     
     text_normalized = re.sub(r'\s+', ' ', text)
+    text_lower = text_normalized.lower() # <--- FIX: Uses cleaned text
     
     # 2. NAME EXTRACTION
     best_name = ""
@@ -98,47 +99,186 @@ def parse_cv_text(text: str) -> dict:
             if len(name) > 3 and not any(w in name.lower() for w in exclude) and not re.search(r'\d', name):
                 best_name = name.split('\n')[0].strip()
                 break
+    
     if not best_name:
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         if lines and len(lines[0]) < 50 and "resume" not in lines[0].lower():
             best_name = lines[0]
+            
     data["Name"] = best_name if best_name else "N/A"
 
-    # 3. PHONE (Includes fix for spaced numbers like 096 51 35 387)
-    phone_match = re.search(r'(?:\+855|0)(?:[\s-]*\d){8,11}', text)
+    # 3. PHONE (Flexible & Typo-tolerant)
+    phone_match = re.search(
+        r'(?:(?:\+|00)?\s*\(?\s*(?:855|885)\s*\)?|0)\s*[-\s\.]?\s*[1-9][\d\s\-\.]{6,12}',
+        text
+    )
+
     if phone_match:
+        # 1. Clean: Get raw string and remove ALL non-digits
         digits = re.sub(r'\D', '', phone_match.group(0))
-        if digits.startswith('855'): digits = '0' + digits[3:]
-        data["Tel"] = digits[:10]
 
-    # 4. BIRTH DATE
-    dob_match = re.search(r"(?:Birth|DOB).*?(\d{1,2}[-/\s\.]\d{1,2}[-/\s\.]\d{2,4})", text, re.IGNORECASE | re.DOTALL)
-    if dob_match: data["Birth"] = dob_match.group(1).replace('\n', '').strip()
+        # 2. Fix Typo: Change leading 885 -> 855
+        if digits.startswith('885'):
+            digits = '855' + digits[3:]
 
-    # 5. LOCATION
-    loc_match = re.search(r'(?:Address|Location)[\s:.-]*([^\n]{5,100})', text, re.IGNORECASE)
-    if loc_match: data["Location"] = loc_match.group(1).strip()[:100]
+        # 3. Standardize to local format (0xx...)
+        if digits.startswith('855'):
+            digits = '0' + digits[3:]
+        elif digits.startswith('00855'):
+            digits = '0' + digits[5:]
 
-    # 6. SCHOOL
-    school_match = re.search(r'([A-Z][A-Za-z\s&-]+(?:University|Institute|High\s*School))', text)
-    if school_match: data["School"] = school_match.group(1).strip()
+        # 4. Final Validation (Cambodia phones are usually 9-10 digits: 0xx xxx xxx)
+        if 9 <= len(digits) <= 10:
+            data["Tel"] = digits
 
-    # 7. EXPERIENCE (Fixed to stop at Languages/Personalities)
-    exp_match = re.search(
-        r'(?:WORK\s+)?(?:EXPERIENCE|EMPLOYMENT|HISTORY)[\s:.-]*'  # Start looking here
-        r'(.*?)'                                                   # Capture content
-        r'(?=\n(?:EDUCATION|SKILLS|REFERENCE|LANGUAGES?|PERSONALITIES|INTEREST|DECLARATION|CERTIF|$))', # STOP here
+    # 4. BIRTH DATE (Fixed: Supports "26 April 2004" and "26/04/2004")
+    dob_match = re.search(
+        r"(?:Birth|DOB|Born)[\s:.-]*"  # Look for label
+        r"((?:\d{1,2}[-/\s\.]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-/\s\.]+\d{4})|"  # Format A: 26 April 2004
+        r"(?:\d{1,2}[-/\s\.]+\d{1,2}[-/\s\.]+\d{2,4}))",  # Format B: 26/04/2004
         text, 
-        re.IGNORECASE | re.DOTALL
+        re.IGNORECASE
     )
     
+    if dob_match: 
+        # Group 1 captures the actual date string from either Format A or B
+        raw_dob = dob_match.group(1).strip()
+        data["Birth"] = raw_dob
+
+    # ==========================================
+    # 5. SMART LOCATION (CAMBODIA HR STANDARD)
+    # ==========================================
+    
+    found_location = False
+
+    # LIST A: 14 Khans (Districts) of Phnom Penh
+    # HR Rule: If found, return ONLY the Khan name (e.g. "Toul Kork")
+    khan_map = {
+        "Chamkar Mon": ["chamkar mon", "chamkarmon"],
+        "Doun Penh": ["doun penh", "daun penh"],
+        "7 Makara": ["7 makara", "prampir meakkakra", "prampir makara"],
+        "Toul Kork": ["tuol kouk", "toul kork", "toulkork"],
+        "Dangkao": ["dangkao", "dangkor"],
+        "Mean Chey": ["mean chey", "meanchey"],
+        "Russey Keo": ["russey keo", "ruessei keo"],
+        "Sen Sok": ["sen sok", "sensok"],
+        "Pou Senchey": ["pou senchey", "por sen chey", "porsenchey"],
+        "Chroy Changvar": ["chroy changvar", "chroychangvar"],
+        "Prek Pnov": ["preaek pnov", "prek pnov", "prek phnov"],
+        "Chbar Ampov": ["chbar ampov", "chbarampov"],
+        "Boeung Keng Kang": ["boeng keng kang", "boeung keng kang", "bkk"],
+        "Kamboul": ["kamboul", "kambol"]
+    }
+
+    # Priority 1: Check for Khans (Most specific)
+    for clean_name, variations in khan_map.items():
+        pattern = r'\b(?:Khan|District)?[\s-]*(' + '|'.join(re.escape(v) for v in variations) + r')\b'
+        if re.search(pattern, text, re.IGNORECASE):
+            data["Location"] = clean_name
+            found_location = True
+            break
+
+    # LIST B: 25 Provinces (if no Khan found)
+    # HR Rule: If found, return ONLY the Province name
+    if not found_location:
+        province_map = {
+            "Kampong Cham": ["kampong cham"],
+            "Kampong Chhnang": ["kampong chhnang"],
+            "Kampong Speu": ["kampong speu"],
+            "Kampong Thom": ["kampong thom"],
+            "Kandal": ["kandal"],
+            "Takeo": ["takeo"],
+            "Preah Vihear": ["preah vihear"],
+            "Stung Treng": ["stung treng"],
+            "Ratanakiri": ["ratanikiri", "ratanakiri"],
+            "Siem Reap": ["siem reap", "siemreap"],
+            "Oddar Meanchey": ["oddar meanchey"],
+            "Banteay Meanchey": ["banteay meanchey"],
+            "Battambang": ["battambang"],
+            "Pursat": ["pursat"],
+            "Pailin": ["pailin"],
+            "Koh Kong": ["koh kong"],
+            "Preah Sihanouk": ["preah sihanouk", "sihanoukville", "kompong som"],
+            "Kampot": ["kampot"],
+            "Kep": ["kep"],
+            "Kratie": ["kratie"],
+            "Mondulkiri": ["mondulkiri"],
+            "Prey Veng": ["prey veng"],
+            "Svay Rieng": ["svay rieng"],
+            "Tbong Khmum": ["tbong khmum"],
+            "Phnom Penh": ["phnom penh"] # Fallback if no specific Khan is mentioned
+        }
+
+        # Priority 2: Check for Provinces
+        for clean_name, variations in province_map.items():
+            pattern = r'\b(?:Province|City|Krong|Khet)?[\s-]*(' + '|'.join(re.escape(v) for v in variations) + r')\b'
+            if re.search(pattern, text, re.IGNORECASE):
+                data["Location"] = clean_name
+                found_location = True
+                break
+
+    # Priority 3: General Fallback (if nothing matched)
+    if not found_location:
+        loc_match = re.search(r'(?:Address|Location)[\s:.-]*([^\n]{5,100})', text, re.IGNORECASE)
+        if loc_match: 
+            data["Location"] = loc_match.group(1).strip()[:100]
+
+    # ==========================================
+    # 6. EDUCATION SHORTCUTS (UNIVERSITY MAP)
+    # ==========================================
+    uni_map = {
+        "RUPP": ["royal university of phnom penh", "rupp"],
+        "ITC": ["institute of technology of cambodia", "itc"],
+        "RUA": ["royal university of agriculture", "rua"],
+        "RULE": ["royal university of law and economics", "rule"],
+        "NUM": ["national university of management", "num"],
+        "RUFA": ["royal university of fine arts", "rufa"],
+        "NPIC": ["national polytechnic institute of cambodia", "npic"],
+        "NPIA": ["national polytechnic institute of angkor", "npia"],
+        "UHS": ["university of health sciences", "uhs"],
+        "NU": ["norton university"],
+        "PUC": ["pannasastra university"],
+        "ZU": ["zaman university"],
+        "BBU": ["build bright university"],
+        "CUST": ["cambodia university of technology and science"],
+        "WU": ["western university"],
+        "IU": ["international university"],
+        "AU": ["angkor university"],
+        "NUBB": ["national university of battambang"],
+        "UC": ["university of cambodia"],
+        "LUCT": ["limkokwing university"],
+        "PIU": ["paragon international university"],
+        "AUPP": ["american university of phnom penh"],
+        "CBS": ["camed business school"]
+    }
+
+    found_uni = False
+    for short_code, variations in uni_map.items():
+        for variation in variations:
+            if variation in text_lower:
+                data["School"] = short_code
+                found_uni = True
+                break
+        if found_uni: break
+    
+    if not found_uni:
+        school_match = re.search(r'([A-Z][A-Za-z\s&-]+(?:University|Institute|High\s*School))', text)
+        if school_match: 
+            data["School"] = school_match.group(1).strip()
+
+    # 7. EXPERIENCE
+    exp_match = re.search(
+        r'(?:WORK\s+)?(?:EXPERIENCE|EMPLOYMENT|HISTORY)[\s:.-]*'
+        r'(.*?)'
+        r'(?=\n(?:EDUCATION|SKILLS|REFERENCE|LANGUAGES?|PERSONALITIES|INTEREST|DECLARATION|CERTIF|$))',
+        text, re.IGNORECASE | re.DOTALL
+    )
     if exp_match: 
         raw = re.sub(r'\s+', ' ', exp_match.group(1)).strip()
-        # Clean up specific noise seen in your screenshot (like "S: . |")
         raw = re.sub(r'^[|:.\s]*', '', raw) 
         data["Experience"] = raw[:350] + ("..." if len(raw) > 350 else "")
-        
-    # 8. GENDER (Robust Fallback)
+
+    # 8. GENDER
     found_gender = False
     explicit_match = re.search(r'\b(?:Gender|Sex)[\s:.-]*([A-Za-z]+)\b', text, re.IGNORECASE)
     if explicit_match:
