@@ -155,7 +155,7 @@ def parse_cv_text(text: str) -> dict:
     # HR Rule: If found, return ONLY the Khan name (e.g. "Toul Kork")
     khan_map = {
         "Chamkar Mon": ["chamkar mon", "chamkarmon"],
-        "Doun Penh": ["doun penh", "daun penh"],
+        "Doun Penh": ["doun penh", "daun penh", "duan penh"],
         "7 Makara": ["7 makara", "prampir meakkakra", "prampir makara"],
         "Toul Kork": ["tuol kouk", "toul kork", "toulkork"],
         "Dangkao": ["dangkao", "dangkor"],
@@ -249,7 +249,8 @@ def parse_cv_text(text: str) -> dict:
         "LUCT": ["limkokwing university"],
         "PIU": ["paragon international university"],
         "AUPP": ["american university of phnom penh"],
-        "CBS": ["camed business school"]
+        "CBS": ["camed business school"],
+        "CMU": ["cambodian mekong university"]
     }
 
     found_uni = False
