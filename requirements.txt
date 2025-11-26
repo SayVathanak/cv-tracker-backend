@@ -10,3 +10,5 @@ motor
 dnspython
 cloudinary
 httpx
+phonenumbers
+google-generativeai
