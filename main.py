@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from typing import List, Optional
 from pydantic import BaseModel
 import cloudinary
@@ -17,14 +18,105 @@ from bson import ObjectId
 from datetime import datetime
 import httpx
 from fastapi.responses import Response
+import phonenumbers 
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION & MAPPINGS ---
+
+# 1. UNIVERSITY MAPPING
+UNI_MAP = {
+    "RUPP":     ["royal university of phnom penh", "rupp"],
+    "ITC":      ["institute of technology of cambodia", "itc", "techno"],
+    "RULE":     ["royal university of law and economics", "rule"],
+    "NUM":      ["national university of management", "num"],
+    "RUA":      ["royal university of agriculture", "rua"],
+    "AUPP":     ["american university of phnom penh", "aupp"],
+    "PUC":      ["pannasastra university", "puc"],
+    "BBU":      ["build bright university", "bbu"],
+    "CUS":      ["cambodia university for specialties", "cus"],
+    "AEU":      ["asia euro university", "aeu"],
+    "HRU":      ["human resources university", "hru"],
+    "CamTech":  ["camtech", "cambodia university of technology and science"],
+    "AIB":      ["acleda institute of business", "aib"],
+    "NPIC":     ["national polytechnic institute of cambodia", "npic"],
+    "UC":       ["university of cambodia", "uc"],
+    "Setec":    ["setec institute", "setec"],
+    "Paragon":  ["paragon international university", "zaman"],
+    "Norton":   ["norton university", "nu"],
+    "Western":  ["western university", "wu"],
+    "Beltei":   ["beltei international university", "beltei"],
+    "Vanda":    ["vanda institute", "vanda"],
+    "USEA":     ["university of south-east asia", "usea"],
+    "NUBB":     ["national university of battambang", "nubb"],
+    "MCU":      ["mean chey university", "mcu"],
+    "IIC":      ["iic university of technology", "iic"],
+    "Chenla":   ["chenla university"],
+    "Kirirom":  ["kirirom institute", "kit"],
+    "Limkokwing": ["limkokwing university"],
+    "PPI":      ["phnom penh international university", "ppiu"]
+}
+
+# 2. PHNOM PENH LOCATIONS (Khan -> Sangkats)
+# Logic: Try to match "Sangkat X, Khan Y"
+PP_LOCATIONS = {
+    "Khan Chamkar Mon": ["tonle bassac", "tuol tumpung", "boeung trabek", "psar daem thkov"],
+    "Khan Daun Penh": ["phsar thmei", "chey chumneas", "srah chak", "wat phnom", "phsar kandal"],
+    "Khan 7 Makara": ["monorom", "mittapheap", "veal vong", "orussey", "boeung prolit"],
+    "Khan Toul Kork": ["boeung kak", "boeng kak", "phsar depo", "teuk l'ak", "teuk laak", "phsar daem kor"],
+    "Khan Dangkao": ["dangkao", "pong tuek", "prey veng", "khmuonh"],
+    "Khan Mean Chey": ["stung meanchey", "steung meanchey", "meanchey", "boeng tumpun", "chak angre"],
+    "Khan Russey Keo": ["tuol sangke", "svay pak", "kilomaetr", "chrang chamreh"],
+    "Khan Sen Sok": ["phnom penh thmei", "teuk thla", "khmuonh", "krang thnong"],
+    "Khan Pou Senchey": ["kakab", "choam chao", "samraong krom"],
+    "Khan Chroy Changvar": ["chroy changvar", "prek leap", "prek ta sek"],
+    "Khan Chbar Ampov": ["chbar ampov", "prek pra", "nirouth", "kbal koh"],
+    "Khan Boeung Keng Kang": ["boeung keng kang", "bkk1", "bkk2", "bkk3", "tuol svay prey"],
+    "Khan Kamboul": ["kamboul", "kantan"]
+}
+
+# 3. SPECIAL PROVINCE CITIES (Format: "City, Province")
+# If these cities/districts are found, we format as "City, Province"
+SPECIAL_CITIES = {
+    "Kandal": ["ta khmau", "takhmau", "ta khmao", "kien svay", "arey ksat", "lvea aem"],
+    "Takeo": ["doun kaev", "daun keo", "tram kak", "bati"],
+    "Kampong Speu": ["chbar mon"],
+    "Siem Reap": ["siem reap municipality", "krong siem reap"],
+    "Battambang": ["krong battambang"]
+}
+
+# 4. STANDARD PROVINCE MAPPING (Format: "Province Name")
+PROVINCE_MAP = {
+    "Siem Reap": ["siem reap"], 
+    "Battambang": ["battambang"],
+    "Kampong Cham": ["kampong cham"], 
+    "Sihanoukville": ["preah sihanouk", "sihanoukville", "kompong som"],
+    "Kandal": ["kandal"], 
+    "Takeo": ["takeo"], 
+    "Kampot": ["kampot"], 
+    "Kep": ["kep"],
+    "Koh Kong": ["koh kong"], 
+    "Prey Veng": ["prey veng"], 
+    "Svay Rieng": ["svay rieng", "bavet"],
+    "Kampong Speu": ["kampong speu"], 
+    "Kampong Thom": ["kampong thom"], 
+    "Kampong Chhnang": ["kampong chhnang"],
+    "Pursat": ["pursat"], 
+    "Pailin": ["pailin"], 
+    "Banteay Meanchey": ["banteay meanchey", "poipet"],
+    "Oddar Meanchey": ["oddar meanchey"], 
+    "Preah Vihear": ["preah vihear"], 
+    "Stung Treng": ["stung treng"],
+    "Ratanakiri": ["ratanakiri", "banlung"], 
+    "Mondulkiri": ["mondulkiri", "sen monorom"], 
+    "Kratie": ["kratie"], 
+    "Tbong Khmum": ["tbong khmum", "tboung khmum"]
+}
+
+# --- SYSTEM CONFIG ---
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 else:
     print("Running on Linux/Cloud - using default Tesseract path")
 
-# --- CLOUDINARY SETUP ---
 cloudinary.config( 
   cloud_name = "dsy9bfpre", 
   api_key = "973775943389468", 
@@ -48,8 +140,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup_db_client():
+    await collection.create_index([("Name", "text"), ("Tel", "text"), ("School", "text"), ("Location", "text")])
+
 # --- TEXT EXTRACTION ---
-def extract_text(file_bytes: bytes, filename: str) -> str:
+
+def _extract_text_sync(file_bytes: bytes, filename: str) -> str:
     filename = filename.lower()
     text = ""
     try:
@@ -63,175 +160,156 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
                 images = convert_from_bytes(file_bytes)
                 for img in images:
                     text += pytesseract.image_to_string(img, lang='khm+eng')
+        
         elif filename.endswith('.docx'):
             doc = docx.Document(io.BytesIO(file_bytes))
             text = "\n".join([para.text for para in doc.paragraphs])
+            
         elif filename.endswith(('.jpg', '.jpeg', '.png')):
             image = Image.open(io.BytesIO(file_bytes))
             text = pytesseract.image_to_string(image, lang='khm+eng')
+            
     except Exception as e:
-        print(f"Error reading file: {e}")
+        print(f"Error reading file {filename}: {e}")
     return text
 
-# --- IMPROVED PARSING LOGIC ---
+async def extract_text(file_bytes: bytes, filename: str) -> str:
+    return await run_in_threadpool(_extract_text_sync, file_bytes, filename)
+
+# --- PARSING LOGIC ---
+
 def parse_cv_text(text: str) -> dict:
-    # 1. Initialization
     data = {
         "Name": "N/A", "Birth": "N/A", "Tel": "N/A",
         "Location": "N/A", "School": "N/A", "Experience": "N/A",
         "Gender": "N/A"
     }
     
-    # Clean text
-    text_normalized = re.sub(r'\s+', ' ', text).strip()
+    # Normalize text
+    text_normalized = re.sub(r'[\u200b\u200c\u200d\uFEFF]', '', text).strip()
     text_lower = text_normalized.lower()
+    search_text = text_lower.replace(".", " ").replace(",", " ") # For cleaner matching
     
-    # 1. NAME EXTRACTION (Improved)
+    # 1. NAME EXTRACTION
     best_name = ""
-    
-    # Cut off text after "Reference" section to prevent grabbing reference names
-    # This prevents "Voeun Vattanak" from being picked up
-    text_for_name = text
-    ref_match = re.search(r'\n(REFERENCE|REFERENCES)', text, re.IGNORECASE)
+    text_for_name = text_normalized
+    ref_match = re.search(r'\n(REFERENCE|REFERENCES|EXPERIENCE|WORK HISTORY)', text_normalized, re.IGNORECASE)
     if ref_match:
-        text_for_name = text[:ref_match.start()]
+        text_for_name = text_normalized[:ref_match.start()]
 
     name_patterns = [
-        # Pattern A: "Name: ..." (Classic)
-        r"(?:Name|Full\s*Name)[\s:.-]*([A-Z][a-zA-Z\s.]{2,50}?)(?=\n|Address|Date|Tel|Contact|Mobile|$)",
-        
-        # Pattern B: Top of file (Now allows dots for Ms./Mr.)
-        r"^([A-Z][a-zA-Z\s.]{2,40})(?:\n|$)",
+        r"(?:Name|Full\s*Name|ឈ្មោះ)[\s:.-]*([A-Z\u1780-\u17FF][a-zA-Z\u1780-\u17FF\s.]{2,50}?)(?=\n|Address|Date|Tel|Contact|Mobile|$)",
+        r"^([A-Z\u1780-\u17FF][a-zA-Z\u1780-\u17FF\s.]{2,40})(?:\n|$)",
     ]
     
     for pattern in name_patterns:
-        # We only search in the SAFE text (before References)
         name_match = re.search(pattern, text_for_name, re.IGNORECASE | re.MULTILINE)
         if name_match:
             name = name_match.group(1).strip()
-            # Bad words filter
             exclude = ['resume', 'curriculum', 'contact', 'vitae', 'apply', 'summary', 'profile', 'personal']
             if len(name) > 3 and not any(w in name.lower() for w in exclude) and not re.search(r'\d', name):
-                # Clean up "Ms." or "Mr." prefix if you want just the name
-                clean_name = re.sub(r'^(Ms\.|Mr\.|Mrs\.|Dr\.)\s*', '', name, flags=re.IGNORECASE)
+                clean_name = re.sub(r'^(Ms\.|Mr\.|Mrs\.|Dr\.|លោក|អ្នកnang)\s*', '', name, flags=re.IGNORECASE)
                 best_name = clean_name
                 break
     
-    # Fallback: Just grab the very first line if it looks like a name
     if not best_name:
-        first_line = text.split('\n')[0].strip()
+        first_line = text_normalized.split('\n')[0].strip()
         if 3 < len(first_line) < 50 and "resume" not in first_line.lower():
             best_name = re.sub(r'^(Ms\.|Mr\.|Mrs\.)\s*', '', first_line, flags=re.IGNORECASE)
-
     data["Name"] = best_name if best_name else "N/A"
 
-    # 3. PHONE
-    phone_match = re.search(
-        r'(?:(?:\+|00)?\s*\(?\s*(?:855|885)\s*\)?|0)\s*[-\s\.]?\s*[1-9][\d\s\-\.]{6,12}',
-        text
-    )
+    # 2. PHONE
+    try:
+        for match in phonenumbers.PhoneNumberMatcher(text_normalized, "KH"):
+            data["Tel"] = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.NATIONAL).replace(" ", "")
+            break 
+    except Exception: pass
 
-    if phone_match:
-        digits = re.sub(r'\D', '', phone_match.group(0))
-        if digits.startswith('885'): digits = '855' + digits[3:]
-        if digits.startswith('855'): digits = '0' + digits[3:]
-        elif digits.startswith('00855'): digits = '0' + digits[5:]
-        if 9 <= len(digits) <= 10: data["Tel"] = digits
-
-    # 4. BIRTH DATE
+    # 3. BIRTH DATE
     dob_match = re.search(
-        r"(?:Birth|DOB|Born)[\s:.-]*((?:\d{1,2}[-/\s\.]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-/\s\.]+\d{4})|(?:\d{1,2}[-/\s\.]+\d{1,2}[-/\s\.]+\d{2,4}))", 
-        text, re.IGNORECASE
+        r"(?:Birth|DOB|Born|Date of Birth)[\s:.-]*((?:\d{1,2}[-/\s\.]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-/\s\.]+\d{4})|(?:\d{1,2}[-/\s\.]+\d{1,2}[-/\s\.]+\d{2,4}))", 
+        text_normalized, re.IGNORECASE
     )
-    if dob_match: 
-        data["Birth"] = dob_match.group(1).strip()
+    if dob_match: data["Birth"] = dob_match.group(1).strip()
 
-    # 5. LOCATION (Khans & Provinces)
+    # 4. LOCATION (Sangkat, Khan / City, Province)
     found_location = False
-    khan_map = {
-        "Chamkar Mon": ["chamkar mon", "chamkarmon"], "Doun Penh": ["doun penh", "daun penh"],
-        "7 Makara": ["7 makara", "prampir meakkakra"], "Toul Kork": ["tuol kouk", "toul kork"],
-        "Dangkao": ["dangkao", "dangkor"], "Mean Chey": ["mean chey"], "Russey Keo": ["russey keo"],
-        "Sen Sok": ["sen sok"], "Pou Senchey": ["pou senchey", "por sen chey"],
-        "Chroy Changvar": ["chroy changvar"], "Prek Pnov": ["prek pnov"], "Chbar Ampov": ["chbar ampov"],
-        "Boeung Keng Kang": ["boeng keng kang", "bkk"], "Kamboul": ["kamboul"]
-    }
-    for clean_name, variations in khan_map.items():
-        pattern = r'\b(?:Khan|District)?[\s-]*(' + '|'.join(re.escape(v) for v in variations) + r')\b'
-        if re.search(pattern, text, re.IGNORECASE):
-            data["Location"] = clean_name; found_location = True; break
-
-    if not found_location:
-        province_map = {
-            "Kampong Cham": ["kampong cham"], "Kampong Chhnang": ["kampong chhnang"],
-            "Kampong Speu": ["kampong speu"], "Kampong Thom": ["kampong thom"], "Kandal": ["kandal"],
-            "Takeo": ["takeo"], "Preah Vihear": ["preah vihear"], "Stung Treng": ["stung treng"],
-            "Ratanakiri": ["ratanikiri"], "Siem Reap": ["siem reap"], "Oddar Meanchey": ["oddar meanchey"],
-            "Banteay Meanchey": ["banteay meanchey"], "Battambang": ["battambang"], "Pursat": ["pursat"],
-            "Pailin": ["pailin"], "Koh Kong": ["koh kong"], "Preah Sihanouk": ["preah sihanouk", "sihanoukville"],
-            "Kampot": ["kampot"], "Kep": ["kep"], "Kratie": ["kratie"], "Mondulkiri": ["mondulkiri"],
-            "Prey Veng": ["prey veng"], "Svay Rieng": ["svay rieng"], "Tbong Khmum": ["tbong khmum"],
-            "Phnom Penh": ["phnom penh"]
-        }
-        for clean_name, variations in province_map.items():
-            pattern = r'\b(?:Province|City|Krong|Khet)?[\s-]*(' + '|'.join(re.escape(v) for v in variations) + r')\b'
-            if re.search(pattern, text, re.IGNORECASE):
-                data["Location"] = clean_name; found_location = True; break
-
-    if not found_location:
-        loc_match = re.search(r'(?:Address|Location)[\s:.-]*([^\n]{5,100})', text, re.IGNORECASE)
-        if loc_match: data["Location"] = loc_match.group(1).strip()[:100]
-
-    # 6. SCHOOL
-    uni_map = {
-        "RUPP":   ["royal university of phnom penh", "rupp"],
-        "ITC":    ["institute of technology of cambodia", "itc"],
-        "RUA":    ["royal university of agriculture", "rua"],
-        "RULE":   ["royal university of law and economics", "rule"],
-        "NUM":    ["national university of management", "num"],
-        "RUFA":   ["royal university of fine arts", "rufa"],
-        "NPIC":   ["national polytechnic institute of cambodia", "npic"],
-        "NPIA":   ["national polytechnic institute of angkor", "npia"],
-        "NTTI": ["national technical training institute", "national training institute"],
-        "UHS":    ["university of health sciences", "uhs"],
-        "NU":     ["norton university"],
-        "PUC":    ["pannasastra university"],
-        "ZU":     ["zaman university"],
-        "PIU":    ["paragon international university", "paragon"],
-        "BBU":    ["build bright university"],
-        "CUST":   ["cambodia university of technology and science"],
-        "WU":     ["western university"],
-        "IU":     ["international university"],
-        "AU":     ["angkor university"],
-        "NUBB":   ["national university of battambang"],
-        "UC":     ["university of cambodia"],
-        "LUCT":   ["limkokwing university"],
-        "AUPP":   ["american university of phnom penh"],
-        "CBS":    ["camed business school", "camed"],
-        "CMU":    ["cambodian mekong university"],
-        "SETEC":  ["setec institute"],
-    }
     
+    # A. PHNOM PENH (Search for Sangkat AND Khan)
+    for khan_name, sangkats in PP_LOCATIONS.items():
+        # 1. Try to find Specific Sangkat
+        sangkat_pattern = r'\b(?:sangkat|commune|s/k)?\s*(' + '|'.join(re.escape(s) for s in sangkats) + r')\b'
+        sangkat_match = re.search(sangkat_pattern, search_text)
+        
+        if sangkat_match:
+            # Result: "Sangkat X, Khan Y"
+            clean_sangkat = sangkat_match.group(1).title()
+            data["Location"] = f"Sangkat {clean_sangkat}, {khan_name}"
+            found_location = True
+            break
+            
+        # 2. If Sangkat not found, check Khan only
+        clean_khan = khan_name.replace("Khan ", "").lower()
+        khan_pattern = r'\b(?:khan|district|d\.)\s*' + re.escape(clean_khan) + r'\b'
+        if re.search(khan_pattern, search_text):
+            data["Location"] = khan_name
+            found_location = True
+            break
+    
+    # B. SPECIAL CITY CHECK (Kandal/Takeo/etc) - Format: "City, Province"
+    if not found_location:
+        for province, cities in SPECIAL_CITIES.items():
+            city_pattern = r'\b(' + '|'.join(re.escape(c) for c in cities) + r')\b'
+            city_match = re.search(city_pattern, search_text)
+            if city_match:
+                # Result: "Ta Khmau, Kandal"
+                clean_city = city_match.group(1).title()
+                data["Location"] = f"{clean_city}, {province}"
+                found_location = True
+                break
+
+    # C. STANDARD PROVINCE CHECK - Format: "Province"
+    if not found_location:
+        for clean_prov, variations in PROVINCE_MAP.items():
+            if clean_prov == "Phnom Penh": continue # Handle PP default last
+            
+            pattern = r'\b(' + '|'.join(re.escape(v) for v in variations) + r')\b'
+            if re.search(pattern, search_text):
+                data["Location"] = clean_prov
+                found_location = True
+                break
+    
+    # D. DEFAULT PHNOM PENH
+    if not found_location:
+        if "phnom penh" in search_text:
+             data["Location"] = "Phnom Penh"
+        else:
+            # Fallback to whatever generic address line we found
+            addr_match = re.search(r'(?:Address|Location|Addr|ទីលំនៅ)[\s:.-]*([^\n]{5,100})', text_normalized, re.IGNORECASE)
+            if addr_match and len(addr_match.group(1)) < 50:
+                 data["Location"] = addr_match.group(1).strip()
+
+    # 5. SCHOOL
     found_uni = False
-    for short_code, variations in uni_map.items():
+    for short_code, variations in UNI_MAP.items():
         for variation in variations:
             if variation in text_lower:
                 data["School"] = short_code; found_uni = True; break
         if found_uni: break
     
     if not found_uni:
-        school_match = re.search(r'([A-Z][A-Za-z\s&-]+(?:University|Institute|High\s*School))', text)
+        school_match = re.search(r'([A-Z][A-Za-z\s&-]+(?:University|Institute|School))', text_normalized)
         if school_match: data["School"] = school_match.group(1).strip()
 
-    # 7. EXPERIENCE
-    exp_match = re.search(r'(?:WORK\s+)?(?:EXPERIENCE|EMPLOYMENT|HISTORY)[\s:.-]*(.*?)(?=\n(?:EDUCATION|SKILLS|REFERENCE|$))', text, re.IGNORECASE | re.DOTALL)
+    # 6. EXPERIENCE
+    exp_match = re.search(r'(?:WORK\s+)?(?:EXPERIENCE|EMPLOYMENT|HISTORY|Professional Background)[\s:.-]*(.*?)(?=\n(?:EDUCATION|SKILLS|REFERENCE|LANGUAGE|$))', text_normalized, re.IGNORECASE | re.DOTALL)
     if exp_match: 
         raw = re.sub(r'\s+', ' ', exp_match.group(1)).strip()
-        data["Experience"] = raw[:350] + ("..." if len(raw) > 350 else "")
+        data["Experience"] = raw[:500] + ("..." if len(raw) > 500 else "")
 
-    # 8. GENDER
-    if re.search(r'\b(?:Female|F)\b', text, re.IGNORECASE): data["Gender"] = "Female"
-    elif re.search(r'\b(?:Male|M)\b', text, re.IGNORECASE): data["Gender"] = "Male"
+    # 7. GENDER
+    if re.search(r'\b(?:Female|F)\b', text_normalized, re.IGNORECASE): data["Gender"] = "Female"
+    elif re.search(r'\b(?:Male|M)\b', text_normalized, re.IGNORECASE): data["Gender"] = "Male"
 
     return data
 
@@ -245,33 +323,40 @@ async def upload_cv(files: List[UploadFile] = File(...)):
             content = await file.read()
             upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=file.filename.split('.')[0])
             cv_url = upload_result.get("secure_url")
-            raw_text = extract_text(content, file.filename)
+            raw_text = await extract_text(content, file.filename)
             structured_data = parse_cv_text(raw_text)
-            structured_data.update({"file_name": file.filename, "cv_url": cv_url, "upload_date": datetime.now().isoformat(), "locked": False})
+            structured_data.update({
+                "file_name": file.filename, 
+                "cv_url": cv_url, 
+                "upload_date": datetime.now().isoformat(), 
+                "locked": False,
+                "raw_text_snippet": raw_text[:200]
+            })
             
             query = {"Name": structured_data["Name"], "Tel": structured_data["Tel"]}
-            existing = await collection.find_one(query)
-            
-            if existing:
-                await collection.update_one({"_id": existing["_id"]}, {"$set": structured_data})
-                structured_data["_id"] = str(existing["_id"])
+            if structured_data["Tel"] == "N/A" and structured_data["Name"] == "N/A":
+                 result = await collection.insert_one(structured_data)
+                 structured_data["_id"] = str(result.inserted_id)
             else:
-                result = await collection.insert_one(structured_data)
-                structured_data["_id"] = str(result.inserted_id)
+                existing = await collection.find_one(query)
+                if existing:
+                    await collection.update_one({"_id": existing["_id"]}, {"$set": structured_data})
+                    structured_data["_id"] = str(existing["_id"])
+                else:
+                    result = await collection.insert_one(structured_data)
+                    structured_data["_id"] = str(result.inserted_id)
             results.append(structured_data)
         except Exception as e:
             print(f"Error processing {file.filename}: {e}")
             results.append({"filename": file.filename, "status": f"Error: {str(e)}"})
     return {"status": f"Processed {len(results)} files", "details": results}
 
-# --- UPDATED CANDIDATES ENDPOINT (SEARCH + PAGINATION) ---
 @app.get("/candidates")
 async def get_candidates(
     page: int = Query(1, ge=1), 
     limit: int = Query(20, le=100),
     search: str = Query(None)
 ):
-    # 1. Build Filter
     query_filter = {}
     if search:
         search_regex = {"$regex": search, "$options": "i"}
@@ -280,14 +365,12 @@ async def get_candidates(
                 {"Name": search_regex},
                 {"Tel": search_regex},
                 {"School": search_regex},
-                {"Location": search_regex}
+                {"Location": search_regex},
+                {"Experience": search_regex}
             ]
         }
 
-    # 2. Get Count
     total_count = await collection.count_documents(query_filter)
-
-    # 3. Fetch Data
     skip = (page - 1) * limit
     cursor = collection.find(query_filter).sort("upload_date", -1).skip(skip).limit(limit)
     
@@ -308,7 +391,8 @@ async def get_candidate_cv(candidate_id: str):
     try:
         obj_id = ObjectId(candidate_id)
         candidate = await collection.find_one({"_id": obj_id})
-        if not candidate or "cv_url" not in candidate: return Response(content="CV not found", status_code=404)
+        if not candidate or "cv_url" not in candidate: 
+            return Response(content="CV not found", status_code=404)
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(candidate["cv_url"])
@@ -322,7 +406,8 @@ async def delete_candidate(candidate_id: str):
     try:
         obj_id = ObjectId(candidate_id)
         candidate = await collection.find_one({"_id": obj_id})
-        if candidate and candidate.get("locked", False): return {"status": "Error: Candidate is locked"}
+        if candidate and candidate.get("locked", False): 
+            return {"status": "Error: Candidate is locked"}
         await collection.delete_one({"_id": obj_id})
         return {"status": "Deleted successfully"}
     except Exception as e:
@@ -337,18 +422,17 @@ async def delete_bulk_candidates(request: BulkDeleteRequest):
     try:
         is_delete_all = len(request.candidate_ids) == 0
         if is_delete_all:
-            if request.passcode != "9994": return {"status": "error", "message": "Invalid passcode"}
+            if request.passcode != "9994": 
+                return {"status": "error", "message": "Invalid passcode"}
             await collection.delete_many({"locked": {"$ne": True}})
             return {"status": "success", "deleted": "All unlocked"}
         else:
-            deleted_count = 0
-            for cid in request.candidate_ids:
-                obj_id = ObjectId(cid)
-                candidate = await collection.find_one({"_id": obj_id})
-                if candidate and not candidate.get("locked", False):
-                    await collection.delete_one({"_id": obj_id})
-                    deleted_count += 1
-            return {"status": "success", "deleted": deleted_count}
+            object_ids = [ObjectId(cid) for cid in request.candidate_ids]
+            result = await collection.delete_many({
+                "_id": {"$in": object_ids},
+                "locked": {"$ne": True}
+            })
+            return {"status": "success", "deleted": result.deleted_count}
     except Exception as e:
         return {"status": f"Error: {e}"}
 
