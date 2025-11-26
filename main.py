@@ -86,7 +86,7 @@ def _extract_text_sync(file_bytes: bytes, filename: str) -> str:
 async def extract_text(file_bytes: bytes, filename: str) -> str:
     return await run_in_threadpool(_extract_text_sync, file_bytes, filename)
 
-# --- 4. AI PARSING LOGIC (The Brain) ---
+    # --- 4. AI PARSING LOGIC (The Brain) ---
 def parse_cv_with_ai(text: str) -> dict:
     """
     Uses Gemini AI to extract structured data from CV text.
@@ -114,6 +114,7 @@ def parse_cv_with_ai(text: str) -> dict:
     - **School:** Extract the most recent University (Use standard abbreviations: RUPP, ITC, NUM, PUC, AUPP, CamTech, etc.).
     - **Experience:** Summarize the last job title and company in < 15 words.
     - **Gender:** Detect Male/Female.
+    - **BirthDate:** Extract Date of Birth. Convert to format 'DD-MM-YYYY' (e.g., 25-12-1999). If not found, return "N/A".
 
     ### CV TEXT TO ANALYZE:
     {text[:15000]} 
@@ -128,7 +129,17 @@ def parse_cv_with_ai(text: str) -> dict:
         data = json.loads(json_text)
         
         # 3. Safety Fallback (Ensure keys exist)
-        defaults = {"Name": "N/A", "Tel": "N/A", "Location": "N/A", "School": "N/A", "Experience": "N/A", "Gender": "N/A"}
+        # ADDED "BirthDate" HERE
+        defaults = {
+            "Name": "N/A", 
+            "Tel": "N/A", 
+            "Location": "N/A", 
+            "School": "N/A", 
+            "Experience": "N/A", 
+            "Gender": "N/A",
+            "BirthDate": "N/A" 
+        }
+        
         for k, v in defaults.items():
             if k not in data or not data[k]:
                 data[k] = v
@@ -136,7 +147,16 @@ def parse_cv_with_ai(text: str) -> dict:
 
     except Exception as e:
         print(f"AI Parsing Error: {e}")
-        return {"Name": "Manual Review Needed", "Tel": "N/A", "Location": "Error Parsing", "School": "N/A", "Experience": "N/A", "Gender": "N/A"}
+        # ADDED "BirthDate" HERE AS WELL
+        return {
+            "Name": "Manual Review Needed", 
+            "Tel": "N/A", 
+            "Location": "Error Parsing", 
+            "School": "N/A", 
+            "Experience": "N/A", 
+            "Gender": "N/A",
+            "BirthDate": "N/A"
+        }
 
 # --- 5. API ENDPOINTS ---
 
