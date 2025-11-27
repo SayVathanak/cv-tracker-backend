@@ -117,7 +117,7 @@ def parse_cv_with_ai(text: str) -> dict:
 
     ### RULES FOR OTHER FIELDS:
     - **Name:** Full name (Capitalize properly). Remove titles like Mr/Ms.
-    - **Tel:** Format as '0xx xxx xxx' (e.g., 012 345 678).
+    - **Tel:** Extract the phone number. Format as '0xx xxx xxx' (9 digits) or '0xx xxx xxxx' (10 digits). Remove parentheses.
     - **School:** Extract the most recent University (Use standard abbreviations: RUPP, ITC, NUM, PUC, AUPP, CamTech, etc.).
     - **Experience:** Summarize the last job title and company in < 15 words.
     - **Gender:** Detect Male/Female.
@@ -175,7 +175,10 @@ async def upload_cv(files: List[UploadFile] = File(...)):
             content = await file.read()
             
             # 1. Cloudinary
-            upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=file.filename.split('.')[0])
+            # Clean the filename: remove anything that isn't a letter or number
+            clean_name = re.sub(r'[^a-zA-Z0-9]', '_', file.filename.split('.')[0])
+            upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=clean_name)
+            
             cv_url = upload_result.get("secure_url")
             
             # 2. Extract Text
