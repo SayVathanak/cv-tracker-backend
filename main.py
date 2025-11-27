@@ -41,13 +41,13 @@ else:
     print("Running on Linux/Cloud - using default Tesseract path")
 
 cloudinary.config( 
-  cloud_name = "dsy9bfpre", 
-  api_key = "973775943389468", 
-  api_secret = "MW6-sD1o_2ck4-XTHIeoH8qEXO4",
+  cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"), 
+  api_key = os.getenv("CLOUDINARY_API_KEY"), 
+  api_secret = os.getenv("CLOUDINARY_SECRET"),
   secure = True
 )
 
-MONGO_URL = "mongodb+srv://saksovathanaksay_db_user:Vathanak99@cluster0.pt9gimf.mongodb.net/?appName=Cluster0"
+MONGO_URL = os.getenv("MONGO_URL")
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.cv_tracking_db
 collection = db.candidates

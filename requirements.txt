@@ -12,3 +12,4 @@ cloudinary
 httpx
 phonenumbers
 google-generativeai
+python-dotenv
