@@ -93,50 +93,41 @@ def _extract_text_sync(file_bytes: bytes, filename: str) -> str:
 async def extract_text(file_bytes: bytes, filename: str) -> str:
     return await run_in_threadpool(_extract_text_sync, file_bytes, filename)
 
-    # --- 4. AI PARSING LOGIC (The Brain) ---
 def parse_cv_with_ai(text: str) -> dict:
     """
     Uses Gemini AI to extract structured data from CV text.
     """
-    # This prompt contains ALL your logic (Sangkats, Cities, Experience, etc.)
     prompt = f"""
     You are an expert HR Data Extractor for Cambodian Candidates.
     Analyze the following CV text and extract the details into a JSON object.
 
     ### RULES FOR LOCATION:
-    1. **Phnom Penh:**
-       - Try to find the specific "Sangkat" and "Khan".
-       - Format: "Sangkat [Name], Khan [Name]" (e.g., "Sangkat Teuk Thla, Khan Sen Sok").
-       - If only Khan is found: "Khan [Name]".
-       - If nothing specific found but mentions Phnom Penh: "Phnom Penh".
-    2. **Kandal & Takeo (Special Cities):**
-       - Look for cities like "Ta Khmau", "Kien Svay", "Doun Kaev", "Tram Kak".
-       - Format: "City, Province" (e.g., "Ta Khmau, Kandal").
-    3. **Other Provinces:**
-       - Return ONLY the Province Name (e.g., "Siem Reap", "Battambang").
+    1. **Phnom Penh:** Format as "Sangkat [Name], Khan [Name]" or "Khan [Name]".
+    2. **Provinces:** Return "City, Province" or just "Province Name".
+
+    ### RULES FOR NEW FIELDS:
+    - **Position:** Extract the Job Title the candidate is applying for. Look for "Applying for...", "Subject: Application for...", "Objective", or a professional title under their name. If not mentioned, return "N/A".
+    - **School:** Extract the HIGHEST education level. 
+       - Priority 1: University/Institute name (e.g., RUPP, SETEC, NUM).
+       - Priority 2: If no university found, extract High School name.
 
     ### RULES FOR OTHER FIELDS:
-    - **Name:** Full name (Capitalize properly). Remove titles like Mr/Ms.
-    - **Tel:** Extract the phone number. Format as '0xx xxx xxx' (9 digits) or '0xx xxx xxxx' (10 digits). Remove parentheses.
-    - **School:** Extract the most recent University (Use standard abbreviations: RUPP, ITC, NUM, PUC, AUPP, CamTech, etc.).
-    - **Experience:** Summarize the last job title and company in < 15 words.
+    - **Name:** Full name (Capitalize properly). Remove titles.
+    - **Tel:** Extract phone number (0xx ...).
+    - **Experience:** Summarize last job title and company (< 15 words).
     - **Gender:** Detect Male/Female.
-    - **BirthDate:** Extract Date of Birth. Convert to format 'DD-MM-YYYY' (e.g., 25-12-1999). If not found, return "N/A".
+    - **BirthDate:** Format 'DD-MM-YYYY'.
 
     ### CV TEXT TO ANALYZE:
     {text[:15000]} 
     """
 
     try:
-        # 1. Ask Gemini
         response = model.generate_content(prompt)
-        
-        # 2. Clean JSON
         json_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(json_text)
         
-        # 3. Safety Fallback (Ensure keys exist)
-        # ADDED "BirthDate" HERE
+        # Updated Defaults to include "Position"
         defaults = {
             "Name": "N/A", 
             "Tel": "N/A", 
@@ -144,7 +135,8 @@ def parse_cv_with_ai(text: str) -> dict:
             "School": "N/A", 
             "Experience": "N/A", 
             "Gender": "N/A",
-            "BirthDate": "N/A" 
+            "BirthDate": "N/A",
+            "Position": "N/A" # <--- NEW FIELD
         }
         
         for k, v in defaults.items():
@@ -154,7 +146,6 @@ def parse_cv_with_ai(text: str) -> dict:
 
     except Exception as e:
         print(f"AI Parsing Error: {e}")
-        # ADDED "BirthDate" HERE AS WELL
         return {
             "Name": "Manual Review Needed", 
             "Tel": "N/A", 
@@ -162,7 +153,8 @@ def parse_cv_with_ai(text: str) -> dict:
             "School": "N/A", 
             "Experience": "N/A", 
             "Gender": "N/A",
-            "BirthDate": "N/A"
+            "BirthDate": "N/A",
+            "Position": "N/A"
         }
 
 # --- 5. API ENDPOINTS ---
@@ -302,3 +294,49 @@ async def toggle_lock(candidate_id: str, request: dict):
         return {"status": "success"}
     except Exception as e:
         return {"status": f"Error: {e}"}
+    
+@app.post("/candidates/{candidate_id}/retry")
+async def retry_parsing(candidate_id: str):
+    try:
+        # 1. Get Candidate
+        obj_id = ObjectId(candidate_id)
+        candidate = await collection.find_one({"_id": obj_id})
+        
+        if not candidate or "cv_url" not in candidate:
+            return {"status": "error", "message": "Candidate or CV URL not found"}
+
+        # 2. Download File from Cloudinary
+        async with httpx.AsyncClient() as client:
+            response = await client.get(candidate["cv_url"])
+            if response.status_code != 200:
+                return {"status": "error", "message": "Failed to download CV file"}
+            file_bytes = response.content
+
+        # 3. Extract Text (Reuse existing logic)
+        # We assume file extension from the stored file_name or url
+        file_name = candidate.get("file_name", "unknown.pdf")
+        raw_text = await extract_text(file_bytes, file_name)
+
+        # 4. Parse with AI (Reuse existing logic)
+        structured_data = parse_cv_with_ai(raw_text)
+
+        # 5. Merge & Update (Keep existing ID and Metadata, overwrite fields)
+        update_payload = {
+            "Name": structured_data["Name"],
+            "Tel": structured_data["Tel"],
+            "Location": structured_data["Location"],
+            "School": structured_data["School"],
+            "Experience": structured_data["Experience"],
+            "Gender": structured_data["Gender"],
+            "BirthDate": structured_data["BirthDate"],
+            "Position": structured_data.get("Position", "N/A"), 
+            "last_modified": datetime.now().isoformat()
+        }
+
+        await collection.update_one({"_id": obj_id}, {"$set": update_payload})
+
+        return {"status": "success", "data": update_payload}
+
+    except Exception as e:
+        print(f"Retry Error: {e}")
+        return {"status": "error", "message": str(e)}
