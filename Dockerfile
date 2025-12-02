@@ -1,25 +1,21 @@
-# 1. Start with a lightweight Python system
-FROM python:3.10-slim
+# Use a lightweight Python image
+FROM python:3.9-slim
 
-# 2. Install the "System Tools" (Tesseract for OCR, Poppler for PDF)
-# This is the step that makes your app work on the cloud!
-RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
-    libtesseract-dev \
-    poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-# 3. Set up the working folder
+# Set the working directory inside the container
 WORKDIR /app
 
-# 4. Copy your files into the container
-COPY . .
+# Copy the requirements file first (for caching)
+COPY requirements.txt .
 
-# 5. Install your Python libraries (FastAPI, etc.)
+# Install Python dependencies
+# We DO NOT need apt-get install tesseract-ocr anymore!
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6. Create the folder for uploads
-RUN mkdir -p static_uploads
+# Copy the rest of your application code
+COPY . .
 
-# 7. Start the server
+# Expose the port (Render usually expects 8000 or 10000)
+EXPOSE 8000
+
+# Command to run the app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
