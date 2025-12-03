@@ -344,17 +344,28 @@ async def upload_cv(
     return {"status": f"Queued {len(results)} files", "details": results}
 
 @app.get("/candidates")
-async def get_candidates(page: int = Query(1, ge=1), limit: int = Query(20, le=100), search: str = Query(None)):
-    # This endpoint remains PUBLIC so the dashboard can load read-only data easily.
-    # If you want it private, add Depends(get_current_user) here too.
-    
-    query_filter = {}
+async def get_candidates(
+    page: int = Query(1, ge=1), 
+    limit: int = Query(20, le=100), 
+    search: str = Query(None),
+    current_user: dict = Depends(get_current_user) # <--- NEW: Require Login
+):
+    # 1. Base Filter: Only show candidates uploaded by THIS user
+    query_filter = {"uploaded_by": current_user["username"]}
+
+    # 2. Add Search Logic (if user is typing)
     if search:
         search_regex = {"$regex": search, "$options": "i"}
+        # Use $and to ensure we match the User AND the Search term
         query_filter = {
-            "$or": [
-                {"Name": search_regex}, {"Tel": search_regex},
-                {"School": search_regex}, {"Location": search_regex}
+            "$and": [
+                {"uploaded_by": current_user["username"]},
+                {
+                    "$or": [
+                        {"Name": search_regex}, {"Tel": search_regex},
+                        {"School": search_regex}, {"Location": search_regex}
+                    ]
+                }
             ]
         }
 
@@ -399,13 +410,23 @@ async def get_candidate_cv(candidate_id: str):
 @app.delete("/candidates/{candidate_id}")
 async def delete_candidate(
     candidate_id: str,
-    current_user: dict = Depends(get_current_user) # PROTECTED
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         obj_id = ObjectId(candidate_id)
-        candidate = await collection.find_one({"_id": obj_id})
-        if candidate and candidate.get("locked", False): 
+        
+        # CHANGED: Check if candidate exists AND belongs to the user
+        candidate = await collection.find_one({
+            "_id": obj_id, 
+            "uploaded_by": current_user["username"]
+        })
+        
+        if not candidate:
+            return {"status": "Error: Candidate not found or access denied"}
+            
+        if candidate.get("locked", False): 
             return {"status": "Error: Candidate is locked"}
+            
         await collection.delete_one({"_id": obj_id})
         return {"status": "Deleted successfully"}
     except Exception as e:
@@ -415,12 +436,21 @@ async def delete_candidate(
 async def update_candidate(
     candidate_id: str, 
     updated_data: dict,
-    current_user: dict = Depends(get_current_user) # PROTECTED
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         if "_id" in updated_data: del updated_data["_id"]
         updated_data["last_modified"] = datetime.now().isoformat()
-        await collection.update_one({"_id": ObjectId(candidate_id)}, {"$set": updated_data})
+        
+        # CHANGED: Add 'uploaded_by' to the query
+        result = await collection.update_one(
+            {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
+            {"$set": updated_data}
+        )
+        
+        if result.matched_count == 0:
+            return {"status": "Error: Candidate not found or access denied"}
+            
         return {"status": "Updated successfully"}
     except Exception as e:
         return {"status": f"Error: {e}"}
@@ -429,10 +459,18 @@ async def update_candidate(
 async def toggle_lock(
     candidate_id: str, 
     request: dict,
-    current_user: dict = Depends(get_current_user) # PROTECTED
+    current_user: dict = Depends(get_current_user)
 ):
     try:
-        await collection.update_one({"_id": ObjectId(candidate_id)}, {"$set": {"locked": request.get("locked", False)}})
+        # CHANGED: Add 'uploaded_by' to the query
+        result = await collection.update_one(
+            {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
+            {"$set": {"locked": request.get("locked", False)}}
+        )
+        
+        if result.matched_count == 0:
+            return {"status": "Error: Access denied"}
+
         return {"status": "success"}
     except Exception as e:
         return {"status": f"Error: {e}"}
@@ -442,43 +480,48 @@ async def toggle_lock(
 @app.post("/candidates/bulk-delete")
 async def bulk_delete_candidates(
     request: BulkDeleteRequest,
-    current_user: dict = Depends(get_current_user) # PROTECTED
+    current_user: dict = Depends(get_current_user)
 ):
     try:
-        # SCENARIO 1: DELETE ALL (Empty list implies everything)
-        # Note: We now trust the Auth Token, so no separate "passcode" needed.
+        user_filter = {"uploaded_by": current_user["username"], "locked": {"$ne": True}}
+
+        # SCENARIO 1: DELETE ALL (Only user's own data)
         if not request.candidate_ids:
-            result = await collection.delete_many({"locked": {"$ne": True}})
+            result = await collection.delete_many(user_filter)
             return {"status": "success", "message": f"Wiped {result.deleted_count} records"}
 
         # SCENARIO 2: DELETE SELECTED
         elif request.candidate_ids:
             ids_to_delete = []
             for cid in request.candidate_ids:
-                try:
-                    ids_to_delete.append(ObjectId(cid))
-                except:
-                    continue
-            result = await collection.delete_many({
-                "_id": {"$in": ids_to_delete},
-                "locked": {"$ne": True}
-            })
+                try: ids_to_delete.append(ObjectId(cid))
+                except: continue
+            
+            # Add ID filter to the User filter
+            user_filter["_id"] = {"$in": ids_to_delete}
+            
+            result = await collection.delete_many(user_filter)
             return {"status": "success", "message": f"Deleted {result.deleted_count} candidates"}
 
         return {"status": "error", "message": "Invalid request"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
+    
 @app.post("/candidates/{candidate_id}/retry")
 async def retry_parsing(
     candidate_id: str, 
     background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_current_user) # PROTECTED
+    current_user: dict = Depends(get_current_user)
 ):
     try:
-        candidate = await collection.find_one({"_id": ObjectId(candidate_id)})
+        # CHANGED: Check ownership
+        candidate = await collection.find_one({
+            "_id": ObjectId(candidate_id),
+            "uploaded_by": current_user["username"]
+        })
+        
         if not candidate:
-            return {"status": "error", "message": "Candidate not found"}
+            return {"status": "error", "message": "Candidate not found or access denied"}
 
         async with httpx.AsyncClient() as client:
             response = await client.get(candidate["cv_url"])
