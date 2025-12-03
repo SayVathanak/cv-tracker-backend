@@ -8,3 +8,6 @@ cloudinary
 google-generativeai
 requests
 httpx
+passlib[bcrypt]
+python-jose[cryptography]
+bcrypt==3.2.0
