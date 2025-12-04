@@ -204,6 +204,13 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             # Sometimes Gemini adds markdown code blocks, strip them
             json_text = response.text.replace("```json", "").replace("```", "").strip()
             data = json.loads(json_text)
+            
+            # --- NEW FIX STARTS HERE ---
+            # If AI returns a list like [{"Name": ...}], take the first item
+            if isinstance(data, list):
+                data = data[0] if len(data) > 0 else {}
+            # --- NEW FIX ENDS HERE ---
+
         except:
             data = {"Name": "Parse Error", "Experience": "AI returned invalid JSON"}
 
