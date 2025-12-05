@@ -1,13 +1,25 @@
+# --- Core Framework ---
 fastapi
-uvicorn
-python-multipart
-python-dotenv
+uvicorn[standard]       # 'standard' includes uvloop (faster) and httptools
+python-multipart        # Required for OAuth2 form handling
+pydantic-settings       # Required for .env management in Pydantic v2
+pydantic[email]         # Required for email validation
+
+# --- Database (MongoDB) ---
 pymongo
 motor
-cloudinary
-google-generativeai
-requests
-httpx
-passlib[bcrypt]
-python-jose[cryptography]
-bcrypt==3.2.0
+
+# --- Authentication & Security ---
+passlib[bcrypt]         # Handles password hashing (installs bcrypt automatically)
+python-jose[cryptography] # JWT token handling
+python-dotenv           # Loads environment variables
+
+# --- Google Services & Cloud ---
+google-generativeai     # Gemini API
+google-auth             # Google Identity
+cloudinary              # Image storage
+
+# --- Utilities ---
+requests                # Sync HTTP client
+httpx                   # Async HTTP client (Better for FastAPI)
+APScheduler             # Scheduled tasks
