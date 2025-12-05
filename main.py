@@ -206,28 +206,27 @@ async def google_login(request: GoogleAuthRequest):
         user = await users_collection.find_one({"username": email})
 
         if not user:
-        # 4. If not, Register them automatically
+            # 4. If not, Register them automatically
             new_user = {
                 "username": email,
                 "hashed_password": "GOOGLE_AUTH_USER",
                 "provider": "google",
                 "created_at": datetime.now().isoformat(),
-                # Initialize credits to 0 (we add the bonus in the next step)
                 "current_credits": 0 
-        }
-        
-        # Insert the new user
-        result = await users_collection.insert_one(new_user)
-        
-        # --- GIVE FREE 10 CREDITS ---
-        await add_credits(
-            user_id=result.inserted_id, 
-            amount=10, 
-            reason="Welcome Gift: Free 10 Credits",
-            ref="SIGNUP_BONUS"
-        )
+            }
+            
+            result = await users_collection.insert_one(new_user)
+            
+            # --- GIVE FREE 10 CREDITS ---
+            await add_credits(
+                user_id=result.inserted_id, 
+                amount=10, 
+                reason="Welcome Gift: Free 10 Credits",
+                ref="SIGNUP_BONUS"
+            )
         
         # 5. Generate Access Token (Log them in)
+        # CRITICAL FIX: Ensure this is indented to match the 'try', NOT the 'if'
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={"sub": email}, expires_delta=access_token_expires
