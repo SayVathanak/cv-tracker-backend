@@ -19,6 +19,9 @@ google-generativeai     # Gemini API
 google-auth             # Google Identity
 cloudinary              # Image storage
 
+# --- Payments ---
+bakong-khqr             # Generates the ABA/Bakong QR codes
+
 # --- Utilities ---
 requests                # Sync HTTP client
 httpx                   # Async HTTP client (Better for FastAPI)

@@ -21,6 +21,8 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import uuid
+from bakong_khqr import KHQR
 
 # Database
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -57,7 +59,19 @@ MONGO_URL = os.getenv("MONGO_URL")
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.cv_tracking_db
 collection = db.candidates
-users_collection = db.users  # New collection for Users
+# users_collection = db.users  # New collection for Users
+users_collection = db["users"]
+
+transactions_collection = db["transactions"]
+BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NjQ5NTIyNDksImV4cCI6MTc3MjcyODI0OX0.tbhgtVlzNrTGhD0mKkN33BgopmENupueM7qa9DsDxOI"
+
+BAKONG_ACCOUNT_ID = "say_vathanak@aclb"
+MERCHANT_NAME = "SAY SAKSOVATHANAK"
+MERCHANT_CITY = "Phnom Penh"
+
+# Initialize the SDK once
+khqr = KHQR(BAKONG_DEV_TOKEN) 
+# ---------------------
 
 # Auth Config
 SECRET_KEY = os.getenv("SECRET_KEY", "YOUR_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD")
@@ -168,6 +182,10 @@ class BulkDeleteRequest(BaseModel):
     
 class GoogleAuthRequest(BaseModel):
     token: str
+    
+class PaymentRequest(BaseModel):
+    package_id: str
+    email: str
 
 @app.post("/auth/google")
 async def google_login(request: GoogleAuthRequest):
@@ -188,15 +206,26 @@ async def google_login(request: GoogleAuthRequest):
         user = await users_collection.find_one({"username": email})
 
         if not user:
-            # 4. If not, Register them automatically
-            # We set hashed_password to None or a random string since they use Google
+        # 4. If not, Register them automatically
             new_user = {
-                "username": email, 
-                "hashed_password": "GOOGLE_AUTH_USER", 
+                "username": email,
+                "hashed_password": "GOOGLE_AUTH_USER",
                 "provider": "google",
-                "created_at": datetime.now().isoformat()
-            }
-            await users_collection.insert_one(new_user)
+                "created_at": datetime.now().isoformat(),
+                # Initialize credits to 0 (we add the bonus in the next step)
+                "current_credits": 0 
+        }
+        
+        # Insert the new user
+        result = await users_collection.insert_one(new_user)
+        
+        # --- GIVE FREE 10 CREDITS ---
+        await add_credits(
+            user_id=result.inserted_id, 
+            amount=10, 
+            reason="Welcome Gift: Free 10 Credits",
+            ref="SIGNUP_BONUS"
+        )
         
         # 5. Generate Access Token (Log them in)
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -438,8 +467,33 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 @app.get("/users/me")
 async def read_users_me(current_user: dict = Depends(get_current_user)):
-    return {"username": current_user["username"]}
+    # Return both username AND current_credits
+    return {
+        "username": current_user["username"],
+        "current_credits": current_user.get("current_credits", 0) 
+    }
 
+async def add_credits(user_id, amount: int, reason: str, ref: str = None):
+    """
+    Updates user balance AND records the transaction history.
+    """
+    # 1. Create a transaction record
+    trx = {
+        "user_id": user_id, # Stores the ObjectId of the user
+        "amount": amount,
+        "type": "PURCHASE" if amount > 0 else "SPEND",
+        "description": reason,
+        "payment_ref": ref,
+        "created_at": datetime.now().isoformat(),
+        "status": "COMPLETED"
+    }
+    await transactions_collection.insert_one(trx)
+
+    # 2. Update the User's "current_credits" balance
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$inc": {"current_credits": amount}}
+    )
 
 # --- CORE API ENDPOINTS ---
 
@@ -457,18 +511,46 @@ async def upload_cv(
 ):
     results = []
     
+    # --- 1. CREDIT CHECK & DEDUCTION ---
+    cost = len(files) # 1 Credit per file
+    user_credits = current_user.get("current_credits", 0)
+    
+    # A. Check if user has enough credits
+    if user_credits < cost:
+        raise HTTPException(
+            status_code=402, # 402 Payment Required
+            detail=f"Insufficient credits. You have {user_credits}, but need {cost}."
+        )
+
+    # B. Deduct credits immediately (Atomic update)
+    await users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$inc": {"current_credits": -cost}}
+    )
+    
+    # C. Record the 'Spend' transaction
+    await transactions_collection.insert_one({
+        "user_id": current_user["_id"],
+        "amount": -cost,
+        "type": "SPEND",
+        "description": f"Uploaded {cost} CV(s)",
+        "created_at": datetime.now().isoformat(),
+        "status": "COMPLETED"
+    })
+
+    # --- 2. PROCESS FILES ---
     for file in files:
         try:
-            # 1. Read file into memory
+            # Read file into memory
             content = await file.read()
             mime_type = file.content_type or "application/pdf"
             
-            # 2. Upload to Cloudinary (Sync)
+            # Upload to Cloudinary (Sync)
             clean_name = re.sub(r'[^a-zA-Z0-9]', '_', file.filename.split('.')[0])
             upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=clean_name)
             cv_url = upload_result.get("secure_url")
             
-            # 3. Create "Placeholder" Candidate
+            # Create "Placeholder" Candidate
             placeholder_data = {
                 "Name": "Processing...", 
                 "Tel": "...", 
@@ -483,13 +565,13 @@ async def upload_cv(
                 "upload_date": datetime.now().isoformat(),
                 "locked": False,
                 "status": "Processing",
-                "uploaded_by": current_user["username"] # Optional: track who uploaded
+                "uploaded_by": current_user["username"] 
             }
             
             insert_result = await collection.insert_one(placeholder_data)
             candidate_id = str(insert_result.inserted_id)
             
-            # 4. Trigger Background Task
+            # Trigger Background Task
             background_tasks.add_task(
                 process_cv_background, 
                 content, 
@@ -506,7 +588,12 @@ async def upload_cv(
             print(f"Upload Error {file.filename}: {e}")
             results.append({"filename": file.filename, "status": "Error", "details": str(e)})
             
-    return {"status": f"Queued {len(results)} files", "details": results}
+    # Return success along with remaining credits so frontend knows
+    return {
+        "status": f"Queued {len(results)} files", 
+        "details": results,
+        "remaining_credits": user_credits - cost
+    }
 
 @app.get("/candidates")
 async def get_candidates(
@@ -714,3 +801,104 @@ async def retry_parsing(
         return {"status": "success", "data": {"status": "Processing"}}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+    
+@app.post("/api/create-payment")
+async def create_khqr_payment(request: PaymentRequest):
+    package_id = request.package_id
+    email = request.email
+
+    packages = {
+        "small": {"price": 1.00, "credits": 20}, 
+        "pro":   {"price": 5.00, "credits": 150} 
+    }
+    
+    if package_id not in packages:
+        raise HTTPException(status_code=400, detail="Invalid package")
+    
+    pkg = packages[package_id]
+    
+    # 1. Generate unique bill number
+    bill_number = str(uuid.uuid4().int)[:10] 
+
+    # 2. Create the QR String
+    qr_response = khqr.create_qr(
+        bank_account=BAKONG_ACCOUNT_ID,
+        merchant_name=MERCHANT_NAME,
+        merchant_city=MERCHANT_CITY,
+        amount=pkg["price"],
+        currency="USD", 
+        phone_number='85592886006',
+        store_label="CV Credits",
+        bill_number=bill_number,
+        terminal_label="POS-01"
+    )
+    
+    # ⚠️ NEW STEP: Generate the MD5 Hash for tracking
+    # The library returns a dictionary for create_qr usually, but your sample implies string.
+    # If qr_response is a dictionary (common in some versions), use qr_response['qr']
+    # If qr_response is just a string (as per your sample), use it directly.
+    qr_string = qr_response 
+    md5_hash = khqr.generate_md5(qr_string)
+
+    # 3. Save PENDING transaction with MD5
+    user = await users_collection.find_one({"username": email})
+    if user:
+        await transactions_collection.insert_one({
+            "user_id": user["_id"],
+            "amount": pkg["credits"],
+            "type": "PURCHASE_INTENT",
+            "status": "PENDING",
+            "payment_ref": bill_number,
+            "md5_hash": md5_hash,  # <--- WE SAVE THIS NOW
+            "created_at": datetime.now().isoformat()
+        })
+
+    return {
+        "qr_code": qr_string, 
+        "md5": md5_hash,
+        "amount": pkg["price"]
+    }
+    
+@app.post("/api/check-payment-status")
+async def check_payment_status(md5_hash: str):
+    """
+    Checks if a specific transaction was paid using the Bakong API.
+    """
+    # 1. Find the transaction in OUR database
+    trx = await transactions_collection.find_one({"md5_hash": md5_hash})
+    
+    if not trx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+        
+    if trx["status"] == "COMPLETED":
+        return {"status": "PAID", "message": "Already processed"}
+
+    # 2. Call Bakong API to verify
+    # Note: This requires BAKONG_DEV_TOKEN to be valid!
+    try:
+        # Based on your sample, this returns "UNPAID" or "PAID"
+        payment_status = khqr.check_payment(md5_hash)
+    except Exception as e:
+        # If token is invalid or API is down
+        print(f"Bakong Error: {e}")
+        raise HTTPException(status_code=500, detail="Cannot verify payment with Bank")
+
+    # 3. If Paid, give credits
+    if payment_status == "PAID": 
+        # Update transaction status
+        await transactions_collection.update_one(
+            {"_id": trx["_id"]},
+            {"$set": {"status": "COMPLETED", "paid_at": datetime.now().isoformat()}}
+        )
+        
+        # Add Credits to User
+        await add_credits(
+            user_id=trx["user_id"],
+            amount=trx["amount"],
+            reason=f"Purchased Credits (Ref: {trx['payment_ref']})",
+            ref=md5_hash
+        )
+        return {"status": "PAID", "new_credits": trx["amount"]}
+    
+    else:
+        return {"status": "UNPAID", "detail": "Payment not received yet"}
