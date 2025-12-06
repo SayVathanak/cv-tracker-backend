@@ -265,28 +265,22 @@ async def start_scheduler():
 
 # --- SECURITY HELPERS ---
 def verify_password(plain_password, hashed_password):
-    # Fix: Ensure the plain_password is a byte string and is truncated if necessary,
-    # to prevent the bcrypt ValueError.
+    # FIX: Truncate password bytes to 72 bytes for passlib/bcrypt compatibility
     if isinstance(plain_password, str):
-        # The password needs to be a byte string, encoded using utf-8 is standard
-        # and then truncated to 72 bytes (characters *might* be less than 72).
         plain_password_bytes = plain_password.encode('utf-8')[:72]
     else:
-        # If it's already bytes, truncate it.
         plain_password_bytes = plain_password[:72]
         
-    # The 'pwd_context.verify' method handles the actual verification
-    return pwd_context.verify(plain_password_bytes, hashed_password)
+    return pwd_context.verify(plain_password_bytes, hashed_password) # <-- Use truncated bytes
 
 def get_password_hash(password):
-    # It is good practice to do the same truncation on hashing, 
-    # to ensure consistency between stored hashes and verification.
+    # FIX: Truncate password bytes to 72 bytes for passlib/bcrypt consistency
     if isinstance(password, str):
         password_bytes = password.encode('utf-8')[:72]
     else:
         password_bytes = password[:72]
         
-    return pwd_context.hash(password_bytes)
+    return pwd_context.hash(password_bytes) # <-- Use truncated bytes
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -463,11 +457,30 @@ async def register(user: UserCreate):
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already registered")
     
-    # Hash password and save
+    # Hash password
     hashed_pw = get_password_hash(user.password)
-    new_user = {"username": user.username, "hashed_password": hashed_pw}
-    await users_collection.insert_one(new_user)
-    return {"message": "User created successfully"}
+    
+    # FIX: Initialize user with current_credits=0 (to match Google flow)
+    new_user = {
+        "username": user.username, 
+        "hashed_password": hashed_pw,
+        "provider": "manual",
+        "created_at": datetime.now().isoformat(),
+        "current_credits": 0 
+    }
+    
+    # Insert and get the result for user_id
+    result = await users_collection.insert_one(new_user)
+    
+    # FIX: Grant the 10-credit bonus (to match Google flow)
+    await add_credits(
+        user_id=result.inserted_id, 
+        amount=10, 
+        reason="Welcome Gift: Free 10 Credits (Manual Signup)",
+        ref="SIGNUP_BONUS_MANUAL"
+    )
+    
+    return {"message": "User created successfully", "bonus_applied": True}
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
