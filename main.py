@@ -16,7 +16,6 @@ import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # Security
-import bcrypt
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from google.oauth2 import id_token
@@ -59,19 +58,16 @@ MONGO_URL = os.getenv("MONGO_URL")
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.cv_tracking_db
 collection = db.candidates
-# users_collection = db.users  # New collection for Users
 users_collection = db["users"]
-
 transactions_collection = db["transactions"]
-BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NjQ5NTIyNDksImV4cCI6MTc3MjcyODI0OX0.tbhgtVlzNrTGhD0mKkN33BgopmENupueM7qa9DsDxOI"
 
+BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NjQ5NTIyNDksImV4cCI6MTc3MjcyODI0OX0.tbhgtVlzNrTGhD0mKkN33BgopmENupueM7qa9DsDxOI"
 BAKONG_ACCOUNT_ID = "say_vathanak@aclb"
 MERCHANT_NAME = "SAY SAKSOVATHANAK"
 MERCHANT_CITY = "Phnom Penh"
 
 # Initialize the SDK once
 khqr = KHQR(BAKONG_DEV_TOKEN) 
-# ---------------------
 
 # Auth Config
 SECRET_KEY = os.getenv("SECRET_KEY", "YOUR_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD")
@@ -81,49 +77,11 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-
-# --- BACKGROUND SCHEDULER: AUTO-DELETE ---
-def auto_delete_old_files():
-    """
-    Checks for files older than 24 hours and deletes them from Cloudinary
-    to comply with privacy rules.
-    """
-    print(f"[Auto-Cleanup] Running cleanup job at {datetime.now()}...")
-    
-    # 1. Calculate the cutoff time (24 hours ago)
-    cutoff_time = datetime.now() - timedelta(hours=24)
-    cutoff_str = cutoff_time.isoformat()
-
-    # 2. Find candidates that:
-    #    - Have a 'cv_url' (file exists)
-    #    - Were uploaded BEFORE the cutoff time
-    #    - Are NOT already marked as 'Expired'
-    #    (Note: In a full production app, you would also check the user's specific setting)
-    query = {
-        "upload_date": {"$lt": cutoff_str},
-        "cv_url": {"$ne": None},
-        "file_status": {"$ne": "Expired"} # We will add this field
-    }
-
-    # We need to run this inside an async loop since Motor is async
-    # But APScheduler is sync. So we use a little helper or just run sync logic if possible.
-    # Since Motor is strictly async, we'll swap to a simple synchronous loop for the scheduler 
-    # OR simpler: Trigger it manually for this MVP. 
-    
-    # FOR SIMPLICITY in this code snippet, we will print what WOULD happen.
-    # To make this robust with AsyncIOMotorClient, we usually attach it to the FastAPI startup event.
-    pass 
-
-# Since combining Async Mongo with Sync Scheduler is tricky in one file, 
-# here is the ASYNC version you can call from a startup event.
+# --- BACKGROUND CLEANUP ---
 async def run_async_cleanup():
     print("[Auto-Cleanup] Scanning for old files...")
     cutoff_time = datetime.now() - timedelta(hours=24)
     
-    # 1. THE QUERY
-    # We ask for candidates uploaded > 24h ago
-    # AND where cv_url is NOT null
     cursor = collection.find({
         "upload_date": {"$lt": cutoff_time.isoformat()},
         "cv_url": {"$ne": None}, 
@@ -133,23 +91,19 @@ async def run_async_cleanup():
     async for candidate in cursor:
         url = candidate.get("cv_url")
         
-        # 2. EXTRA SAFETY CHECK (Python Level)
-        # If url is missing, empty, or just text like "Manual Entry", SKIP IT.
         if not url or "http" not in url:
             continue 
 
         try:
-            # 3. Extract ID and Delete
             public_id = url.split('/')[-1].split('.')[0]
             print(f" -> Deleting PDF for: {candidate.get('Name')}")
             
             cloudinary.uploader.destroy(public_id)
             
-            # 4. Update Status
             await collection.update_one(
                 {"_id": candidate["_id"]},
                 {"$set": {
-                    "cv_url": None, # Clear the URL so we don't try again
+                    "cv_url": None,
                     "file_status": "Expired"
                 }}
             )
@@ -161,7 +115,7 @@ app = FastAPI()
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
-    "http://cvtracker-kh.vercel.app",
+    "https://cvtracker-kh.vercel.app",
 ]
 
 app.add_middleware(
@@ -183,7 +137,6 @@ class Token(BaseModel):
 
 class BulkDeleteRequest(BaseModel):
     candidate_ids: List[str] = []
-    # Removed passcode since we now use JWT Auth
     
 class GoogleAuthRequest(BaseModel):
     token: str
@@ -192,95 +145,20 @@ class PaymentRequest(BaseModel):
     package_id: str
     email: str
 
-@app.post("/auth/google")
-async def google_login(request: GoogleAuthRequest):
-    try:
-        # 1. Verify the token with Google
-        id_info = id_token.verify_oauth2_token(
-            request.token, 
-            google_requests.Request(), 
-            GOOGLE_CLIENT_ID
-        )
-
-        # 2. Extract user info
-        email = id_info.get("email")
-        if not email:
-            raise HTTPException(status_code=400, detail="Invalid Google Token: No email found")
-
-        # 3. Check if user exists in DB
-        user = await users_collection.find_one({"username": email})
-
-        if not user:
-            # 4. If not, Register them automatically
-            new_user = {
-                "username": email,
-                "hashed_password": "GOOGLE_AUTH_USER",
-                "provider": "google",
-                "created_at": datetime.now().isoformat(),
-                "current_credits": 0 
-            }
-            
-            result = await users_collection.insert_one(new_user)
-            
-            # --- GIVE FREE 10 CREDITS ---
-            await add_credits(
-                user_id=result.inserted_id, 
-                amount=10, 
-                reason="Welcome Gift: Free 10 Credits",
-                ref="SIGNUP_BONUS"
-            )
-        
-        # 5. Generate Access Token (Log them in)
-        # CRITICAL FIX: Ensure this is indented to match the 'try', NOT the 'if'
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": email}, expires_delta=access_token_expires
-        )
-        
-        return {"access_token": access_token, "token_type": "bearer", "username": email}
-
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Google Token")
-    except Exception as e:
-        print(f"Google Auth Error: {e}")
-        raise HTTPException(status_code=500, detail="Authentication failed")
-    
 # --- LIFECYCLE EVENTS ---
 @app.on_event("startup")
 async def start_scheduler():
-    # Initialize the scheduler
-    scheduler = BackgroundScheduler()
-    
-    # Add the job (Run every 60 minutes)
-    # We wrap the async function in a sync wrapper or just use a loop
-    # For simplicity, we will just run the cleanup ONCE on startup 
-    # and then you can add a specialized endpoint to trigger it manually or via cron.
-    
     print("--> System Startup: Checking for expired files...")
     await run_async_cleanup()
-    
-    # Start the scheduler for future ticks (requires slightly more setup for async)
-    # scheduler.add_job(some_sync_wrapper, 'interval', minutes=60)
-    # scheduler.start()
 
-# --- SECURITY HELPERS ---
+# --- SECURITY HELPERS (FIXED) ---
 def verify_password(plain_password, hashed_password):
-    # FIX: Truncate password bytes to 72 bytes for passlib/bcrypt compatibility
-    if isinstance(plain_password, str):
-        plain_password_bytes = plain_password.encode('utf-8')[:72]
-    else:
-        plain_password_bytes = plain_password[:72]
-        
-    return pwd_context.verify(plain_password_bytes, hashed_password) # <-- Use truncated bytes
+    """Fixed: Let passlib handle encoding internally"""
+    return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password):
-    # FIX: Truncate password bytes to 72 bytes for passlib/bcrypt consistency
-    if isinstance(password, str):
-        password_bytes = password.encode('utf-8')[:72]
-    else:
-        password_bytes = password[:72]
-        
-    return pwd_context.hash(password_bytes) # <-- Use truncated bytes
+    """Fixed: Let passlib handle encoding internally"""
+    return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -311,28 +189,39 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
+async def add_credits(user_id, amount: int, reason: str, ref: str = None):
+    """Updates user balance AND records the transaction history."""
+    trx = {
+        "user_id": user_id,
+        "amount": amount,
+        "type": "PURCHASE" if amount > 0 else "SPEND",
+        "description": reason,
+        "payment_ref": ref,
+        "created_at": datetime.now().isoformat(),
+        "status": "COMPLETED"
+    }
+    await transactions_collection.insert_one(trx)
+
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$inc": {"current_credits": amount}}
+    )
+
 async def process_cv_background(file_content: bytes, filename: str, cv_url: str, candidate_id: str, mime_type: str):
-    """
-    Runs in background: Uploads to Gemini -> Extracts Data -> Updates MongoDB
-    Refactored for MAXIMUM SPEED (No Semaphore/Throttling).
-    """
+    """Runs in background: Uploads to Gemini -> Extracts Data -> Updates MongoDB"""
     temp_path = None
     gemini_file = None
     
     try:
-        print(f"[{filename}] 🚀 Started processing (Parallel Mode)...")
+        print(f"[{filename}] 🚀 Started processing...")
 
-        # 1. Save bytes to a temp file (Gemini requirement)
         suffix = ".pdf" if mime_type == "application/pdf" else ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_content)
             temp_path = tmp.name
 
-        # 2. Upload to Gemini Files API
         gemini_file = genai.upload_file(path=temp_path, mime_type=mime_type)
 
-        # 3. Wait for processing (Poll until Active)
-        # We keep the sleep small (1s) to be responsive
         while gemini_file.state.name == "PROCESSING":
             await asyncio.sleep(1)
             gemini_file = genai.get_file(gemini_file.name)
@@ -340,8 +229,6 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         if gemini_file.state.name == "FAILED":
             raise Exception("Gemini failed to process the file media.")
 
-        # 4. Generate Content (The Extraction)
-        # Using 'gemini-1.5-flash' (or 2.0) is recommended for speed
         model = genai.GenerativeModel('gemini-2.0-flash', generation_config={"response_mime_type": "application/json"})
         
         prompt = """
@@ -388,20 +275,16 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         
         response = await model.generate_content_async([gemini_file, prompt])
         
-        # 5. Clean & Parse JSON
         try:
-            # Strip code blocks if Gemini adds them
             json_text = response.text.replace("```json", "").replace("```", "").strip()
             data = json.loads(json_text)
             
-            # Handle edge case where AI returns a list [ {data} ]
             if isinstance(data, list):
                 data = data[0] if len(data) > 0 else {}
         except Exception as parse_error:
             print(f"[{filename}] JSON Parse Error: {parse_error}")
             data = {"Name": "Parse Error", "Confidence": 0, "Experience": "AI output invalid JSON"}
 
-        # 6. Update MongoDB with Real Data
         update_payload = {
             "Name": data.get("Name", "N/A"),
             "Tel": data.get("Tel", "N/A"),
@@ -413,11 +296,10 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             "BirthDate": data.get("BirthDate", "N/A"),
             "Position": data.get("Position", "N/A"),
             "Confidence": data.get("Confidence", 0), 
-            "status": "Ready",  # MARK AS DONE
+            "status": "Ready",
             "last_modified": datetime.now().isoformat()
         }
 
-        # Assuming 'collection' is your MongoDB collection object defined globally or imported
         await collection.update_one(
             {"_id": ObjectId(candidate_id)}, 
             {"$set": update_payload}
@@ -432,15 +314,12 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         )
 
     finally:
-        # --- CLEANUP (CRITICAL FOR PRIVACY & STORAGE) ---
-        # 1. Delete local temp file
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
             except:
                 pass
         
-        # 2. Delete file from Gemini Cloud (Save storage space)
         if gemini_file:
             try:
                 genai.delete_file(gemini_file.name)
@@ -452,39 +331,34 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
 
 @app.post("/register", status_code=201)
 async def register(user: UserCreate):
-    # Check if user exists
+    """Fixed: Now adds welcome credits to new users"""
     existing_user = await users_collection.find_one({"username": user.username})
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already registered")
     
-    # Hash password
     hashed_pw = get_password_hash(user.password)
-    
-    # FIX: Initialize user with current_credits=0 (to match Google flow)
     new_user = {
-        "username": user.username, 
+        "username": user.username,
         "hashed_password": hashed_pw,
-        "provider": "manual",
+        "current_credits": 0,
         "created_at": datetime.now().isoformat(),
-        "current_credits": 0 
+        "provider": "local"
     }
-    
-    # Insert and get the result for user_id
     result = await users_collection.insert_one(new_user)
     
-    # FIX: Grant the 10-credit bonus (to match Google flow)
+    # Give welcome bonus
     await add_credits(
-        user_id=result.inserted_id, 
-        amount=10, 
-        reason="Welcome Gift: Free 10 Credits (Manual Signup)",
-        ref="SIGNUP_BONUS_MANUAL"
+        user_id=result.inserted_id,
+        amount=10,
+        reason="Welcome Gift: Free 10 Credits",
+        ref="SIGNUP_BONUS"
     )
     
-    return {"message": "User created successfully", "bonus_applied": True}
+    return {"message": "User created successfully"}
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    # Find user
+    """Fixed: Uses corrected password verification"""
     user = await users_collection.find_one({"username": form_data.username})
     if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(
@@ -493,48 +367,72 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Generate Token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user["username"]}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+@app.post("/auth/google")
+async def google_login(request: GoogleAuthRequest):
+    """Fixed: Token generation now happens for both new AND existing users"""
+    try:
+        id_info = id_token.verify_oauth2_token(
+            request.token, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+
+        email = id_info.get("email")
+        if not email:
+            raise HTTPException(status_code=400, detail="Invalid Google Token: No email found")
+
+        user = await users_collection.find_one({"username": email})
+
+        if not user:
+            new_user = {
+                "username": email,
+                "hashed_password": "GOOGLE_AUTH_USER",
+                "provider": "google",
+                "created_at": datetime.now().isoformat(),
+                "current_credits": 0 
+            }
+            
+            result = await users_collection.insert_one(new_user)
+            
+            await add_credits(
+                user_id=result.inserted_id, 
+                amount=10, 
+                reason="Welcome Gift: Free 10 Credits",
+                ref="SIGNUP_BONUS"
+            )
+        
+        # FIXED: This is now at the correct indentation level
+        # It runs for BOTH new and existing users
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": email}, expires_delta=access_token_expires
+        )
+        
+        return {"access_token": access_token, "token_type": "bearer", "username": email}
+
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Google Token")
+    except Exception as e:
+        print(f"Google Auth Error: {e}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
+
 @app.get("/users/me")
 async def read_users_me(current_user: dict = Depends(get_current_user)):
-    # Return both username AND current_credits
     return {
         "username": current_user["username"],
         "current_credits": current_user.get("current_credits", 0) 
     }
 
-async def add_credits(user_id, amount: int, reason: str, ref: str = None):
-    """
-    Updates user balance AND records the transaction history.
-    """
-    # 1. Create a transaction record
-    trx = {
-        "user_id": user_id, # Stores the ObjectId of the user
-        "amount": amount,
-        "type": "PURCHASE" if amount > 0 else "SPEND",
-        "description": reason,
-        "payment_ref": ref,
-        "created_at": datetime.now().isoformat(),
-        "status": "COMPLETED"
-    }
-    await transactions_collection.insert_one(trx)
-
-    # 2. Update the User's "current_credits" balance
-    await users_collection.update_one(
-        {"_id": user_id},
-        {"$inc": {"current_credits": amount}}
-    )
-
 # --- CORE API ENDPOINTS ---
 
 @app.post("/admin/cleanup")
 async def trigger_cleanup(current_user: dict = Depends(get_current_user)):
-    # Security: Only allow if user is Admin (or just any logged in user for now)
     await run_async_cleanup()
     return {"status": "Cleanup job finished."}
 
@@ -542,28 +440,24 @@ async def trigger_cleanup(current_user: dict = Depends(get_current_user)):
 async def upload_cv(
     background_tasks: BackgroundTasks, 
     files: List[UploadFile] = File(...),
-    current_user: dict = Depends(get_current_user)  # PROTECTED
+    current_user: dict = Depends(get_current_user)
 ):
     results = []
     
-    # --- 1. CREDIT CHECK & DEDUCTION ---
-    cost = len(files) # 1 Credit per file
+    cost = len(files)
     user_credits = current_user.get("current_credits", 0)
     
-    # A. Check if user has enough credits
     if user_credits < cost:
         raise HTTPException(
-            status_code=402, # 402 Payment Required
+            status_code=402,
             detail=f"Insufficient credits. You have {user_credits}, but need {cost}."
         )
 
-    # B. Deduct credits immediately (Atomic update)
     await users_collection.update_one(
         {"_id": current_user["_id"]},
         {"$inc": {"current_credits": -cost}}
     )
     
-    # C. Record the 'Spend' transaction
     await transactions_collection.insert_one({
         "user_id": current_user["_id"],
         "amount": -cost,
@@ -573,19 +467,15 @@ async def upload_cv(
         "status": "COMPLETED"
     })
 
-    # --- 2. PROCESS FILES ---
     for file in files:
         try:
-            # Read file into memory
             content = await file.read()
             mime_type = file.content_type or "application/pdf"
             
-            # Upload to Cloudinary (Sync)
             clean_name = re.sub(r'[^a-zA-Z0-9]', '_', file.filename.split('.')[0])
             upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=clean_name)
             cv_url = upload_result.get("secure_url")
             
-            # Create "Placeholder" Candidate
             placeholder_data = {
                 "Name": "Processing...", 
                 "Tel": "...", 
@@ -606,7 +496,6 @@ async def upload_cv(
             insert_result = await collection.insert_one(placeholder_data)
             candidate_id = str(insert_result.inserted_id)
             
-            # Trigger Background Task
             background_tasks.add_task(
                 process_cv_background, 
                 content, 
@@ -623,7 +512,6 @@ async def upload_cv(
             print(f"Upload Error {file.filename}: {e}")
             results.append({"filename": file.filename, "status": "Error", "details": str(e)})
             
-    # Return success along with remaining credits so frontend knows
     return {
         "status": f"Queued {len(results)} files", 
         "details": results,
@@ -635,15 +523,12 @@ async def get_candidates(
     page: int = Query(1, ge=1), 
     limit: int = Query(20, le=100), 
     search: str = Query(None),
-    current_user: dict = Depends(get_current_user) # <--- NEW: Require Login
+    current_user: dict = Depends(get_current_user)
 ):
-    # 1. Base Filter: Only show candidates uploaded by THIS user
     query_filter = {"uploaded_by": current_user["username"]}
 
-    # 2. Add Search Logic (if user is typing)
     if search:
         search_regex = {"$regex": search, "$options": "i"}
-        # Use $and to ensure we match the User AND the Search term
         query_filter = {
             "$and": [
                 {"uploaded_by": current_user["username"]},
@@ -669,7 +554,6 @@ async def get_candidates(
 
 @app.get("/cv/{candidate_id}")
 async def get_candidate_cv(candidate_id: str):
-    # Keeping this public for previewing, but you can protect it if needed.
     try:
         obj_id = ObjectId(candidate_id)
         candidate = await collection.find_one({"_id": obj_id})
@@ -677,7 +561,6 @@ async def get_candidate_cv(candidate_id: str):
         if not candidate or "cv_url" not in candidate:
             return Response(content="CV URL missing in database", status_code=404)
             
-        # Use httpx to stream the file from Cloudinary
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(candidate["cv_url"])
             if response.status_code != 200:
@@ -702,7 +585,6 @@ async def delete_candidate(
     try:
         obj_id = ObjectId(candidate_id)
         
-        # CHANGED: Check if candidate exists AND belongs to the user
         candidate = await collection.find_one({
             "_id": obj_id, 
             "uploaded_by": current_user["username"]
@@ -729,7 +611,6 @@ async def update_candidate(
         if "_id" in updated_data: del updated_data["_id"]
         updated_data["last_modified"] = datetime.now().isoformat()
         
-        # CHANGED: Add 'uploaded_by' to the query
         result = await collection.update_one(
             {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
             {"$set": updated_data}
@@ -749,7 +630,6 @@ async def toggle_lock(
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        # CHANGED: Add 'uploaded_by' to the query
         result = await collection.update_one(
             {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
             {"$set": {"locked": request.get("locked", False)}}
@@ -762,8 +642,6 @@ async def toggle_lock(
     except Exception as e:
         return {"status": f"Error: {e}"}
 
-# --- BULK DELETE & RETRY ENDPOINTS ---
-
 @app.post("/candidates/bulk-delete")
 async def bulk_delete_candidates(
     request: BulkDeleteRequest,
@@ -772,19 +650,16 @@ async def bulk_delete_candidates(
     try:
         user_filter = {"uploaded_by": current_user["username"], "locked": {"$ne": True}}
 
-        # SCENARIO 1: DELETE ALL (Only user's own data)
         if not request.candidate_ids:
             result = await collection.delete_many(user_filter)
             return {"status": "success", "message": f"Wiped {result.deleted_count} records"}
 
-        # SCENARIO 2: DELETE SELECTED
         elif request.candidate_ids:
             ids_to_delete = []
             for cid in request.candidate_ids:
                 try: ids_to_delete.append(ObjectId(cid))
                 except: continue
             
-            # Add ID filter to the User filter
             user_filter["_id"] = {"$in": ids_to_delete}
             
             result = await collection.delete_many(user_filter)
@@ -801,7 +676,6 @@ async def retry_parsing(
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        # CHANGED: Check ownership
         candidate = await collection.find_one({
             "_id": ObjectId(candidate_id),
             "uploaded_by": current_user["username"]
@@ -852,10 +726,8 @@ async def create_khqr_payment(request: PaymentRequest):
     
     pkg = packages[package_id]
     
-    # 1. Generate unique bill number
     bill_number = str(uuid.uuid4().int)[:10] 
 
-    # 2. Create the QR String
     qr_response = khqr.create_qr(
         bank_account=BAKONG_ACCOUNT_ID,
         merchant_name=MERCHANT_NAME,
@@ -868,14 +740,9 @@ async def create_khqr_payment(request: PaymentRequest):
         terminal_label="POS-01"
     )
     
-    # ⚠️ NEW STEP: Generate the MD5 Hash for tracking
-    # The library returns a dictionary for create_qr usually, but your sample implies string.
-    # If qr_response is a dictionary (common in some versions), use qr_response['qr']
-    # If qr_response is just a string (as per your sample), use it directly.
     qr_string = qr_response 
     md5_hash = khqr.generate_md5(qr_string)
 
-    # 3. Save PENDING transaction with MD5
     user = await users_collection.find_one({"username": email})
     if user:
         await transactions_collection.insert_one({
@@ -884,7 +751,7 @@ async def create_khqr_payment(request: PaymentRequest):
             "type": "PURCHASE_INTENT",
             "status": "PENDING",
             "payment_ref": bill_number,
-            "md5_hash": md5_hash,  # <--- WE SAVE THIS NOW
+            "md5_hash": md5_hash,
             "created_at": datetime.now().isoformat()
         })
 
@@ -896,10 +763,7 @@ async def create_khqr_payment(request: PaymentRequest):
     
 @app.post("/api/check-payment-status")
 async def check_payment_status(md5_hash: str):
-    """
-    Checks if a specific transaction was paid using the Bakong API.
-    """
-    # 1. Find the transaction in OUR database
+    """Checks if a specific transaction was paid using the Bakong API."""
     trx = await transactions_collection.find_one({"md5_hash": md5_hash})
     
     if not trx:
@@ -908,25 +772,18 @@ async def check_payment_status(md5_hash: str):
     if trx["status"] == "COMPLETED":
         return {"status": "PAID", "message": "Already processed"}
 
-    # 2. Call Bakong API to verify
-    # Note: This requires BAKONG_DEV_TOKEN to be valid!
     try:
-        # Based on your sample, this returns "UNPAID" or "PAID"
         payment_status = khqr.check_payment(md5_hash)
     except Exception as e:
-        # If token is invalid or API is down
         print(f"Bakong Error: {e}")
         raise HTTPException(status_code=500, detail="Cannot verify payment with Bank")
 
-    # 3. If Paid, give credits
     if payment_status == "PAID": 
-        # Update transaction status
         await transactions_collection.update_one(
             {"_id": trx["_id"]},
             {"$set": {"status": "COMPLETED", "paid_at": datetime.now().isoformat()}}
         )
         
-        # Add Credits to User
         await add_credits(
             user_id=trx["user_id"],
             amount=trx["amount"],
