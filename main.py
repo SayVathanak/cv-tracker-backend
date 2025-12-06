@@ -264,10 +264,28 @@ async def start_scheduler():
 
 # --- SECURITY HELPERS ---
 def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+    # Fix: Ensure the plain_password is a byte string and is truncated if necessary,
+    # to prevent the bcrypt ValueError.
+    if isinstance(plain_password, str):
+        # The password needs to be a byte string, encoded using utf-8 is standard
+        # and then truncated to 72 bytes (characters *might* be less than 72).
+        plain_password_bytes = plain_password.encode('utf-8')[:72]
+    else:
+        # If it's already bytes, truncate it.
+        plain_password_bytes = plain_password[:72]
+        
+    # The 'pwd_context.verify' method handles the actual verification
+    return pwd_context.verify(plain_password_bytes, hashed_password)
 
 def get_password_hash(password):
-    return pwd_context.hash(password)
+    # It is good practice to do the same truncation on hashing, 
+    # to ensure consistency between stored hashes and verification.
+    if isinstance(password, str):
+        password_bytes = password.encode('utf-8')[:72]
+    else:
+        password_bytes = password[:72]
+        
+    return pwd_context.hash(password_bytes)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
