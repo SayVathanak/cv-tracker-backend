@@ -16,6 +16,7 @@ import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # Security
+import bcrypt
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from google.oauth2 import id_token
