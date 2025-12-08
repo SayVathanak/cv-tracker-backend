@@ -563,24 +563,123 @@ async def create_khqr_payment(request: PaymentRequest):
 
     return {"qr_code": qr, "md5": md5_hash, "amount": pkg["price"]}
     
+# Search for this endpoint in main.py and REPLACE it with this version:
+
 @app.post("/api/check-payment-status")
-async def check_payment_status(md5_hash: str):
+async def check_payment_status(md5_hash: str, force: bool = Query(False)):
+    """
+    Checks payment status. 
+    Added 'force=True' to simulate payment success in Dev mode.
+    """
+    # 1. Find the transaction
     trx = await transactions_collection.find_one({"md5_hash": md5_hash})
-    if not trx: raise HTTPException(status_code=404, detail="Transaction not found")
-    if trx["status"] == "COMPLETED": return {"status": "PAID", "message": "Already processed"}
-
-    try:
-        status_res = khqr.check_payment(md5_hash)
-    except:
-        return {"status": "PENDING", "detail": "Payment check busy"}
-
-    if status_res == "PAID": 
-        await transactions_collection.update_one(
-            {"_id": trx["_id"]}, {"$set": {"status": "COMPLETED", "paid_at": datetime.now().isoformat()}}
-        )
-        await add_credits(trx["user_id"], trx["amount"], f"Purchased Credits", md5_hash)
-        
-        updated_user = await users_collection.find_one({"_id": trx["user_id"]})
-        return {"status": "PAID", "new_credits": trx["amount"], "total_credits": updated_user.get("current_credits", 0)}
     
-    return {"status": "UNPAID"}
+    if not trx: 
+        raise HTTPException(status_code=404, detail="Transaction not found")
+        
+    # 2. If already paid, return success immediately
+    if trx.get("status") == "COMPLETED": 
+        user = await users_collection.find_one({"_id": trx["user_id"]})
+        return {
+            "status": "PAID", 
+            "message": "Already processed", 
+            "new_credits": trx["amount"],
+            "total_credits": user.get("current_credits", 0)
+        }
+
+    # 3. Check Real Status
+    payment_status = "UNPAID"
+    try:
+        response = khqr.check_payment(md5_hash)
+        if response == "PAID":
+            payment_status = "PAID"
+    except Exception as e:
+        logger.error(f"Bakong API Check Error: {e}")
+
+    # 4. DEV OVERRIDE (The Fix)
+    # If force=True is passed in the URL, we ignore the API and mark it PAID
+    if force:
+        logger.info(f"Force-approving transaction: {md5_hash}")
+        payment_status = "PAID"
+
+    # 5. Process the Success
+    if payment_status == "PAID": 
+        # Mark as completed in DB
+        await transactions_collection.update_one(
+            {"_id": trx["_id"]}, 
+            {"$set": {"status": "COMPLETED", "paid_at": datetime.now().isoformat()}}
+        )
+        
+        # Add Credits to User
+        await add_credits(
+            trx["user_id"], 
+            trx["amount"], 
+            f"Purchased Credits (Ref: {trx.get('payment_ref', 'N/A')})", 
+            md5_hash
+        )
+        
+        # Return new balance
+        updated_user = await users_collection.find_one({"_id": trx["user_id"]})
+        return {
+            "status": "PAID", 
+            "new_credits": trx["amount"], 
+            "total_credits": updated_user.get("current_credits", 0)
+        }
+    
+    return {"status": "UNPAID", "detail": "Payment not received yet"}
+
+@app.get("/admin/transactions")
+async def get_all_transactions(current_user: dict = Depends(get_current_user)):
+    """
+    Fetches the last 50 transactions for the Admin Panel.
+    """
+    # In a real app, add check: if current_user["role"] != "admin": raise ...
+    
+    cursor = transactions_collection.find().sort("created_at", -1).limit(50)
+    transactions = []
+    
+    async for trx in cursor:
+        # Get username for context
+        user = await users_collection.find_one({"_id": trx["user_id"]})
+        username = user["username"] if user else "Unknown"
+        
+        transactions.append({
+            "id": str(trx["_id"]),
+            "username": username,
+            "amount": trx["amount"],
+            "type": trx["type"],
+            "status": trx["status"], # PENDING, COMPLETED
+            "md5_hash": trx.get("md5_hash"),
+            "payment_ref": trx.get("payment_ref"),
+            "created_at": trx["created_at"]
+        })
+        
+    return transactions
+
+@app.delete("/admin/transactions")
+async def clear_all_transactions(current_user: dict = Depends(get_current_user)):
+    """
+    Dev Utility: Wipes the entire transaction history.
+    """
+    await transactions_collection.delete_many({})
+    return {"status": "success", "message": "Transaction history wiped."}
+
+@app.post("/admin/add-credits")
+async def admin_add_credits(username: str, amount: int):
+    """
+    Cheat code to instantly add credits to any user.
+    """
+    user = await users_collection.find_one({"username": username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Use your existing helper function so it logs the transaction
+    await add_credits(
+        user_id=user["_id"],
+        amount=amount,
+        reason="Admin Manual Top-up",
+        ref="DEV_CHEAT"
+    )
+    
+    return {"status": "success", "message": f"Added {amount} credits to {username}"}
+
