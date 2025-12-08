@@ -6,9 +6,13 @@ import re
 import tempfile
 import asyncio
 import json
+import logging
+import traceback
+import uuid
 
 # Web Framework
-from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Response, Depends, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Response, Depends, HTTPException, status, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -20,7 +24,6 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
-import uuid
 from bakong_khqr import KHQR
 
 # Database
@@ -33,19 +36,25 @@ import cloudinary
 import cloudinary.uploader
 import google.generativeai as genai
 
+# --- 1. LOGGING & CONFIGURATION ---
 load_dotenv()
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+# Configure Logging (Prints timestamps and error details to console)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
+# Validate API Keys
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise ValueError("No GEMINI_API_KEY found")
+    logger.error("No GEMINI_API_KEY found. Application may not function correctly.")
 
-# Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Cloudinary Config
 cloudinary.config( 
   cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"), 
   api_key = os.getenv("CLOUDINARY_API_KEY"), 
@@ -53,7 +62,7 @@ cloudinary.config(
   secure = True
 )
 
-# Database Config
+# Database Setup
 MONGO_URL = os.getenv("MONGO_URL")
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.cv_tracking_db
@@ -61,25 +70,24 @@ collection = db.candidates
 users_collection = db["users"]
 transactions_collection = db["transactions"]
 
+# Payment Setup
 BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NjQ5NTIyNDksImV4cCI6MTc3MjcyODI0OX0.tbhgtVlzNrTGhD0mKkN33BgopmENupueM7qa9DsDxOI"
 BAKONG_ACCOUNT_ID = "say_vathanak@aclb"
 MERCHANT_NAME = "SAY SAKSOVATHANAK"
 MERCHANT_CITY = "Phnom Penh"
-
-# Initialize the SDK once
 khqr = KHQR(BAKONG_DEV_TOKEN) 
 
-# Auth Config
+# Auth Setup
 SECRET_KEY = os.getenv("SECRET_KEY", "YOUR_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated=["auto"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# --- BACKGROUND CLEANUP ---
+# --- 2. BACKGROUND TASKS ---
 async def run_async_cleanup():
-    print("[Auto-Cleanup] Scanning for old files...")
+    """Deletes old PDF files from Cloudinary to save space."""
+    logger.info("[Auto-Cleanup] Scanning for old files...")
     cutoff_time = datetime.now() - timedelta(hours=24)
     
     cursor = collection.find({
@@ -90,130 +98,32 @@ async def run_async_cleanup():
 
     async for candidate in cursor:
         url = candidate.get("cv_url")
-        
-        if not url or "http" not in url:
-            continue 
+        if not url or "http" not in url: continue 
 
         try:
             public_id = url.split('/')[-1].split('.')[0]
-            print(f" -> Deleting PDF for: {candidate.get('Name')}")
-            
+            logger.info(f" -> Deleting PDF for: {candidate.get('Name')}")
             cloudinary.uploader.destroy(public_id)
             
             await collection.update_one(
                 {"_id": candidate["_id"]},
-                {"$set": {
-                    "cv_url": None,
-                    "file_status": "Expired"
-                }}
+                {"$set": {"cv_url": None, "file_status": "Expired"}}
             )
         except Exception as e:
-            print(f"Error cleaning {candidate.get('_id')}: {e}")
-
-# App Config
-app = FastAPI()
-
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "https://cvtracker-kh.vercel.app",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- AUTH MODELS ---
-class UserCreate(BaseModel):
-    username: str
-    password: str
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class BulkDeleteRequest(BaseModel):
-    candidate_ids: List[str] = []
-    
-class GoogleAuthRequest(BaseModel):
-    token: str
-    
-class PaymentRequest(BaseModel):
-    package_id: str
-    email: str
-
-# --- LIFECYCLE EVENTS ---
-@app.on_event("startup")
-async def start_scheduler():
-    print("--> System Startup: Checking for expired files...")
-    await run_async_cleanup()
-
-# --- SECURITY HELPERS (FIXED) ---
-def verify_password(plain_password, hashed_password):
-    """Fixed: Let passlib handle encoding internally"""
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    """Fixed: Let passlib handle encoding internally"""
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-        
-    user = await users_collection.find_one({"username": username})
-    if user is None:
-        raise credentials_exception
-    return user
-
-async def add_credits(user_id, amount: int, reason: str, ref: str = None):
-    """Updates user balance AND records the transaction history."""
-    trx = {
-        "user_id": user_id,
-        "amount": amount,
-        "type": "PURCHASE" if amount > 0 else "SPEND",
-        "description": reason,
-        "payment_ref": ref,
-        "created_at": datetime.now().isoformat(),
-        "status": "COMPLETED"
-    }
-    await transactions_collection.insert_one(trx)
-
-    await users_collection.update_one(
-        {"_id": user_id},
-        {"$inc": {"current_credits": amount}}
-    )
+            logger.error(f"Error cleaning {candidate.get('_id')}: {e}")
 
 async def process_cv_background(file_content: bytes, filename: str, cv_url: str, candidate_id: str, mime_type: str):
-    """Runs in background: Uploads to Gemini -> Extracts Data -> Updates MongoDB"""
+    """
+    Background Task: 
+    1. Uploads file to Gemini
+    2. Extracts Data using AI
+    3. Updates MongoDB with results or error message
+    """
     temp_path = None
     gemini_file = None
     
     try:
-        print(f"[{filename}] 🚀 Started processing...")
+        logger.info(f"[{filename}] 🚀 Started AI processing...")
 
         suffix = ".pdf" if mime_type == "application/pdf" else ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -222,6 +132,7 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
 
         gemini_file = genai.upload_file(path=temp_path, mime_type=mime_type)
 
+        # Wait for Gemini processing
         while gemini_file.state.name == "PROCESSING":
             await asyncio.sleep(1)
             gemini_file = genai.get_file(gemini_file.name)
@@ -235,30 +146,25 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         You are an expert HR Data Extractor for candidates in Cambodia.
         Analyze the uploaded CV and extract details into a JSON object.
 
-        ### 1. STANDARDIZATION RULES (Strict Enums):
-        - **EducationLevel:** MUST be one of: ['High School', 'Associate Degree', 'Bachelor Degree', 'Master Degree', 'PhD', 'Other']. 
-          (Map 'B.Sc', 'Year 3 Student', 'University' -> 'Bachelor Degree').
-        - **Gender:** MUST be one of: ['Male', 'Female', 'N/A'].
+        ### 1. STANDARDIZATION RULES:
+        - **EducationLevel:** ['High School', 'Associate Degree', 'Bachelor Degree', 'Master Degree', 'PhD', 'Other'].
+        - **Gender:** ['Male', 'Female', 'N/A'].
         
-        ### 2. LOCATION RULES (Cambodia Context):
+        ### 2. LOCATION RULES:
         - Format: "Sangkat [Name], Khan [Name]" or "City, Province".
-        - If only "Phnom Penh" is found, return "Phnom Penh".
+        - If only "Phnom Penh", return "Phnom Penh".
 
-        ### 3. CONFIDENCE SCORE (0-100):
-        - Rate your confidence in the extraction accuracy.
-        - **100:** Perfect PDF, clear text, all fields found.
-        - **80:** Good, but maybe missing Address or Birthday.
-        - **50:** Blurry image, handwriting, or very sparse data.
-        - **0:** Unreadable.
+        ### 3. CONFIDENCE (0-100):
+        - Rate confidence based on text clarity and field completeness.
 
         ### 4. DATA FIELDS:
-        - **Name:** Full Name (Title Case). Remove "Mr./Ms.".
-        - **Tel:** "0xx xxx xxx" format. Remove (+855).
+        - **Name:** Full Name (Title Case).
+        - **Tel:** "0xx xxx xxx" format.
         - **Experience:** Summarize last job title & company (Max 15 words).
-        - **Position:** The role they are applying for (or current role).
-        - **School:** Name of the University/School only.
+        - **Position:** Role applied for.
+        - **School:** University Name only.
 
-        Return JSON with keys:
+        Return JSON:
         {
             "Name": "String",
             "Tel": "String",
@@ -278,11 +184,9 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         try:
             json_text = response.text.replace("```json", "").replace("```", "").strip()
             data = json.loads(json_text)
-            
-            if isinstance(data, list):
-                data = data[0] if len(data) > 0 else {}
+            if isinstance(data, list): data = data[0] if len(data) > 0 else {}
         except Exception as parse_error:
-            print(f"[{filename}] JSON Parse Error: {parse_error}")
+            logger.warning(f"[{filename}] JSON Parse Error: {parse_error}")
             data = {"Name": "Parse Error", "Confidence": 0, "Experience": "AI output invalid JSON"}
 
         update_payload = {
@@ -300,141 +204,181 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             "last_modified": datetime.now().isoformat()
         }
 
-        await collection.update_one(
-            {"_id": ObjectId(candidate_id)}, 
-            {"$set": update_payload}
-        )
-        print(f"[{filename}] ✅ Success! Confidence: {data.get('Confidence')}")
+        await collection.update_one({"_id": ObjectId(candidate_id)}, {"$set": update_payload})
+        logger.info(f"[{filename}] ✅ Success! Confidence: {data.get('Confidence')}")
 
     except Exception as e:
-        print(f"[{filename}] ❌ Error: {e}")
+        logger.error(f"[{filename}] ❌ Background Processing Failed: {str(e)}")
+        logger.error(traceback.format_exc())
+
+        # Friendly error message for the user DB record
+        user_msg = "Failed to analyze CV."
+        if "429" in str(e): user_msg = "System is busy (AI Quota). Retry later."
+        elif "json" in str(e).lower(): user_msg = "AI could not read document format."
+        
         await collection.update_one(
             {"_id": ObjectId(candidate_id)}, 
-            {"$set": {"status": "Error", "error_msg": str(e)}}
+            {"$set": {"status": "Error", "error_msg": user_msg}}
         )
 
     finally:
         if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-        
+            try: os.remove(temp_path)
+            except: pass
         if gemini_file:
-            try:
-                genai.delete_file(gemini_file.name)
-                print(f"[{filename}] Cleaned up Gemini file.")
-            except Exception as e:
-                print(f"[{filename}] Cleanup Warning: {e}")
+            try: genai.delete_file(gemini_file.name)
+            except: pass
 
-# --- AUTH ENDPOINTS ---
+# --- 3. APP INITIALIZATION & GLOBAL HANDLERS ---
+app = FastAPI()
+
+# Handler 1: Catch Known HTTP Exceptions (like 402 Insufficient Credits)
+# This allows the specific "detail" message to reach the frontend.
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "message": exc.detail},
+    )
+
+# Handler 2: Catch Unexpected Crashes (500)
+# Logs the error for you, gives a generic message to the user.
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_id = uuid.uuid4()
+    logger.error(f"--- Unhandled Error ID: {error_id} | Path: {request.url.path} ---")
+    logger.error(f"Details: {str(exc)}")
+    logger.error(traceback.format_exc())
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "message": "An unexpected system error occurred. Please contact support.",
+            "error_id": str(error_id)
+        },
+    )
+
+ALLOWED_ORIGINS = ["http://localhost:5173", "https://cvtracker-kh.vercel.app"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 4. DATA MODELS ---
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class BulkDeleteRequest(BaseModel):
+    candidate_ids: List[str] = []
+    
+class GoogleAuthRequest(BaseModel):
+    token: str
+    
+class PaymentRequest(BaseModel):
+    package_id: str
+    email: str
+
+# --- 5. HELPER FUNCTIONS ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None: raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+        
+    user = await users_collection.find_one({"username": username})
+    if user is None: raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+async def add_credits(user_id, amount: int, reason: str, ref: str = None):
+    await transactions_collection.insert_one({
+        "user_id": user_id,
+        "amount": amount,
+        "type": "PURCHASE" if amount > 0 else "SPEND",
+        "description": reason,
+        "payment_ref": ref,
+        "created_at": datetime.now().isoformat(),
+        "status": "COMPLETED"
+    })
+    await users_collection.update_one({"_id": user_id}, {"$inc": {"current_credits": amount}})
+
+# --- 6. API ENDPOINTS ---
+
+@app.on_event("startup")
+async def start_scheduler():
+    logger.info("--> System Startup: Checking for expired files...")
+    await run_async_cleanup()
 
 @app.post("/register", status_code=201)
 async def register(user: UserCreate):
-    """Fixed: Now adds welcome credits to new users"""
-    existing_user = await users_collection.find_one({"username": user.username})
-    if existing_user:
+    if await users_collection.find_one({"username": user.username}):
         raise HTTPException(status_code=400, detail="Username already registered")
     
-    hashed_pw = get_password_hash(user.password)
     new_user = {
         "username": user.username,
-        "hashed_password": hashed_pw,
+        "hashed_password": get_password_hash(user.password),
         "current_credits": 0,
         "created_at": datetime.now().isoformat(),
         "provider": "local"
     }
     result = await users_collection.insert_one(new_user)
-    
-    # Give welcome bonus
-    await add_credits(
-        user_id=result.inserted_id,
-        amount=10,
-        reason="Welcome Gift: Free 10 Credits",
-        ref="SIGNUP_BONUS"
-    )
-    
+    await add_credits(result.inserted_id, 10, "Welcome Gift: Free 10 Credits", "SIGNUP_BONUS")
     return {"message": "User created successfully"}
 
 @app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    """Fixed: Uses corrected password verification"""
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = await users_collection.find_one({"username": form_data.username})
     if not user or not verify_password(form_data.password, user["hashed_password"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
     
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+    token = create_access_token(data={"sub": user["username"]}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/auth/google")
 async def google_login(request: GoogleAuthRequest):
-    """Fixed: Token generation now happens for both new AND existing users"""
     try:
-        id_info = id_token.verify_oauth2_token(
-            request.token, 
-            google_requests.Request(), 
-            GOOGLE_CLIENT_ID
-        )
-
+        id_info = id_token.verify_oauth2_token(request.token, google_requests.Request(), GOOGLE_CLIENT_ID)
         email = id_info.get("email")
-        if not email:
-            raise HTTPException(status_code=400, detail="Invalid Google Token: No email found")
-
+        
         user = await users_collection.find_one({"username": email})
-
         if not user:
-            new_user = {
-                "username": email,
-                "hashed_password": "GOOGLE_AUTH_USER",
-                "provider": "google",
-                "created_at": datetime.now().isoformat(),
-                "current_credits": 0 
-            }
-            
-            result = await users_collection.insert_one(new_user)
-            
-            await add_credits(
-                user_id=result.inserted_id, 
-                amount=10, 
-                reason="Welcome Gift: Free 10 Credits",
-                ref="SIGNUP_BONUS"
-            )
+            result = await users_collection.insert_one({
+                "username": email, "hashed_password": "GOOGLE_AUTH_USER",
+                "provider": "google", "created_at": datetime.now().isoformat(), "current_credits": 0
+            })
+            await add_credits(result.inserted_id, 10, "Welcome Gift", "SIGNUP_BONUS")
         
-        # FIXED: This is now at the correct indentation level
-        # It runs for BOTH new and existing users
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": email}, expires_delta=access_token_expires
-        )
-        
-        return {"access_token": access_token, "token_type": "bearer", "username": email}
-
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Google Token")
+        token = create_access_token(data={"sub": email}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+        return {"access_token": token, "token_type": "bearer", "username": email}
     except Exception as e:
-        print(f"Google Auth Error: {e}")
-        raise HTTPException(status_code=500, detail="Authentication failed")
+        logger.error(f"Google Auth Error: {e}")
+        raise HTTPException(status_code=400, detail="Google Authentication failed")
 
 @app.get("/users/me")
 async def read_users_me(current_user: dict = Depends(get_current_user)):
-    return {
-        "username": current_user["username"],
-        "current_credits": current_user.get("current_credits", 0) 
-    }
-
-# --- CORE API ENDPOINTS ---
-
-@app.post("/admin/cleanup")
-async def trigger_cleanup(current_user: dict = Depends(get_current_user)):
-    await run_async_cleanup()
-    return {"status": "Cleanup job finished."}
+    return {"username": current_user["username"], "current_credits": current_user.get("current_credits", 0)}
 
 @app.post("/upload-cv")
 async def upload_cv(
@@ -442,81 +386,64 @@ async def upload_cv(
     files: List[UploadFile] = File(...),
     current_user: dict = Depends(get_current_user)
 ):
+    """
+    Handles file upload with credit deduction.
+    If credits are insufficient for the batch, it raises a 402 Error.
+    """
     results = []
-    
     cost = len(files)
     user_credits = current_user.get("current_credits", 0)
     
     if user_credits < cost:
         raise HTTPException(
             status_code=402,
-            detail=f"Insufficient credits. You have {user_credits}, but need {cost}."
+            # This text is what the user sees in the pop-up
+            detail=f"Your credit balance is too low to upload {cost} files. Please top up your account to continue."
         )
 
-    await users_collection.update_one(
-        {"_id": current_user["_id"]},
-        {"$inc": {"current_credits": -cost}}
-    )
+    # Deduct credits
+    await users_collection.update_one({"_id": current_user["_id"]}, {"$inc": {"current_credits": -cost}})
     
     await transactions_collection.insert_one({
-        "user_id": current_user["_id"],
-        "amount": -cost,
-        "type": "SPEND",
-        "description": f"Uploaded {cost} CV(s)",
-        "created_at": datetime.now().isoformat(),
-        "status": "COMPLETED"
+        "user_id": current_user["_id"], "amount": -cost, "type": "SPEND",
+        "description": f"Uploaded {cost} CV(s)", "created_at": datetime.now().isoformat(), "status": "COMPLETED"
     })
 
     for file in files:
         try:
             content = await file.read()
-            mime_type = file.content_type or "application/pdf"
-            
             clean_name = re.sub(r'[^a-zA-Z0-9]', '_', file.filename.split('.')[0])
-            upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=clean_name)
+            
+            try:
+                upload_result = cloudinary.uploader.upload(content, resource_type="auto", public_id=clean_name)
+            except Exception as e:
+                logger.error(f"Cloudinary Error: {e}")
+                raise Exception("File storage service is unavailable.")
+
             cv_url = upload_result.get("secure_url")
             
             placeholder_data = {
-                "Name": "Processing...", 
-                "Tel": "...", 
-                "Location": "...", 
-                "School": "...", 
-                "Experience": "AI is analyzing...", 
-                "Gender": "...",
-                "BirthDate": "...",
-                "Position": "...",
-                "file_name": file.filename,
-                "cv_url": cv_url,
-                "upload_date": datetime.now().isoformat(),
-                "locked": False,
-                "status": "Processing",
-                "uploaded_by": current_user["username"] 
+                "Name": "Processing...", "Tel": "...", "Location": "...", "School": "...", 
+                "Experience": "AI is analyzing...", "Gender": "...", "BirthDate": "...", "Position": "...",
+                "file_name": file.filename, "cv_url": cv_url, "upload_date": datetime.now().isoformat(),
+                "locked": False, "status": "Processing", "uploaded_by": current_user["username"]
             }
             
             insert_result = await collection.insert_one(placeholder_data)
             candidate_id = str(insert_result.inserted_id)
             
             background_tasks.add_task(
-                process_cv_background, 
-                content, 
-                file.filename, 
-                cv_url, 
-                candidate_id,
-                mime_type
+                process_cv_background, content, file.filename, cv_url, candidate_id, file.content_type
             )
             
             placeholder_data["_id"] = candidate_id
             results.append(placeholder_data)
 
         except Exception as e:
-            print(f"Upload Error {file.filename}: {e}")
+            logger.error(f"Upload Error {file.filename}: {e}", exc_info=True)
             results.append({"filename": file.filename, "status": "Error", "details": str(e)})
             
-    return {
-        "status": f"Queued {len(results)} files", 
-        "details": results,
-        "remaining_credits": user_credits - cost
-    }
+    return {"status": f"Queued {len(results)} files", "details": results, "remaining_credits": user_credits - cost}
 
 @app.get("/candidates")
 async def get_candidates(
@@ -526,271 +453,134 @@ async def get_candidates(
     current_user: dict = Depends(get_current_user)
 ):
     query_filter = {"uploaded_by": current_user["username"]}
-
     if search:
         search_regex = {"$regex": search, "$options": "i"}
-        query_filter = {
-            "$and": [
-                {"uploaded_by": current_user["username"]},
-                {
-                    "$or": [
-                        {"Name": search_regex}, {"Tel": search_regex},
-                        {"School": search_regex}, {"Location": search_regex}
-                    ]
-                }
-            ]
-        }
+        query_filter["$and"] = [{
+            "$or": [{"Name": search_regex}, {"Tel": search_regex}, {"School": search_regex}, {"Location": search_regex}]
+        }]
 
     total_count = await collection.count_documents(query_filter)
-    skip = (page - 1) * limit
-    cursor = collection.find(query_filter).sort("upload_date", -1).skip(skip).limit(limit)
-    
-    candidates = []
-    async for candidate in cursor:
-        candidate["_id"] = str(candidate["_id"])
-        candidates.append(candidate)
+    cursor = collection.find(query_filter).sort("upload_date", -1).skip((page - 1) * limit).limit(limit)
+    candidates = [ {**c, "_id": str(c["_id"])} async for c in cursor ]
         
     return {"data": candidates, "page": page, "limit": limit, "total": total_count}
 
 @app.get("/cv/{candidate_id}")
 async def get_candidate_cv(candidate_id: str):
     try:
-        obj_id = ObjectId(candidate_id)
-        candidate = await collection.find_one({"_id": obj_id})
-        
-        if not candidate or "cv_url" not in candidate:
-            return Response(content="CV URL missing in database", status_code=404)
+        candidate = await collection.find_one({"_id": ObjectId(candidate_id)})
+        if not candidate: return Response(content="Not Found", status_code=404)
             
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(candidate["cv_url"])
-            if response.status_code != 200:
-                 return Response(content=f"Cloudinary Error: {response.status_code}", status_code=404)
-        
-        media_type = "application/pdf"
-        url_lower = candidate["cv_url"].lower()
-        if any(ext in url_lower for ext in [".jpg", ".jpeg", ".png"]):
-            media_type = "image/jpeg"
-
-        return Response(content=response.content, media_type=media_type)
-        
-    except Exception as e:
-        print(f"CV Download Error: {e}")
-        return Response(content=f"Server Error: {str(e)}", status_code=500)
-
-@app.delete("/candidates/{candidate_id}")
-async def delete_candidate(
-    candidate_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        obj_id = ObjectId(candidate_id)
-        
-        candidate = await collection.find_one({
-            "_id": obj_id, 
-            "uploaded_by": current_user["username"]
-        })
-        
-        if not candidate:
-            return {"status": "Error: Candidate not found or access denied"}
-            
-        if candidate.get("locked", False): 
-            return {"status": "Error: Candidate is locked"}
-            
-        await collection.delete_one({"_id": obj_id})
-        return {"status": "Deleted successfully"}
-    except Exception as e:
-        return {"status": f"Error: {e}"}
-
-@app.put("/candidates/{candidate_id}")
-async def update_candidate(
-    candidate_id: str, 
-    updated_data: dict,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        if "_id" in updated_data: del updated_data["_id"]
-        updated_data["last_modified"] = datetime.now().isoformat()
-        
-        result = await collection.update_one(
-            {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
-            {"$set": updated_data}
-        )
-        
-        if result.matched_count == 0:
-            return {"status": "Error: Candidate not found or access denied"}
-            
-        return {"status": "Updated successfully"}
-    except Exception as e:
-        return {"status": f"Error: {e}"}
-
-@app.put("/candidates/{candidate_id}/lock")
-async def toggle_lock(
-    candidate_id: str, 
-    request: dict,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        result = await collection.update_one(
-            {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
-            {"$set": {"locked": request.get("locked", False)}}
-        )
-        
-        if result.matched_count == 0:
-            return {"status": "Error: Access denied"}
-
-        return {"status": "success"}
-    except Exception as e:
-        return {"status": f"Error: {e}"}
-
-@app.post("/candidates/bulk-delete")
-async def bulk_delete_candidates(
-    request: BulkDeleteRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        user_filter = {"uploaded_by": current_user["username"], "locked": {"$ne": True}}
-
-        if not request.candidate_ids:
-            result = await collection.delete_many(user_filter)
-            return {"status": "success", "message": f"Wiped {result.deleted_count} records"}
-
-        elif request.candidate_ids:
-            ids_to_delete = []
-            for cid in request.candidate_ids:
-                try: ids_to_delete.append(ObjectId(cid))
-                except: continue
-            
-            user_filter["_id"] = {"$in": ids_to_delete}
-            
-            result = await collection.delete_many(user_filter)
-            return {"status": "success", "message": f"Deleted {result.deleted_count} candidates"}
-
-        return {"status": "error", "message": "Invalid request"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    
-@app.post("/candidates/{candidate_id}/retry")
-async def retry_parsing(
-    candidate_id: str, 
-    background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        candidate = await collection.find_one({
-            "_id": ObjectId(candidate_id),
-            "uploaded_by": current_user["username"]
-        })
-        
-        if not candidate:
-            return {"status": "error", "message": "Candidate not found or access denied"}
-
         async with httpx.AsyncClient() as client:
             response = await client.get(candidate["cv_url"])
-            if response.status_code != 200:
-                return {"status": "error", "message": "Failed to download CV"}
-            file_content = response.content
-
-        mime_type = "application/pdf"
-        if any(ext in candidate["cv_url"].lower() for ext in [".jpg", ".jpeg", ".png"]):
-            mime_type = "image/jpeg"
-
-        await collection.update_one(
-            {"_id": ObjectId(candidate_id)},
-            {"$set": {"status": "Processing", "Name": "Retrying..."}}
-        )
-
-        background_tasks.add_task(
-            process_cv_background, 
-            file_content, 
-            candidate.get("file_name", "retry"), 
-            candidate["cv_url"], 
-            candidate_id, 
-            mime_type
-        )
-        return {"status": "success", "data": {"status": "Processing"}}
+        
+        media_type = "image/jpeg" if any(x in candidate["cv_url"] for x in [".jpg", ".png"]) else "application/pdf"
+        return Response(content=response.content, media_type=media_type)
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Download Error: {e}")
+        return Response(content="Server Error", status_code=500)
+
+@app.delete("/candidates/{candidate_id}")
+async def delete_candidate(candidate_id: str, current_user: dict = Depends(get_current_user)):
+    candidate = await collection.find_one({"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]})
+    if not candidate: raise HTTPException(status_code=404, detail="Candidate not found")
+    if candidate.get("locked"): raise HTTPException(status_code=403, detail="Candidate is locked")
+    
+    await collection.delete_one({"_id": ObjectId(candidate_id)})
+    return {"status": "Deleted successfully"}
+
+@app.put("/candidates/{candidate_id}")
+async def update_candidate(candidate_id: str, updated_data: dict, current_user: dict = Depends(get_current_user)):
+    if "_id" in updated_data: del updated_data["_id"]
+    updated_data["last_modified"] = datetime.now().isoformat()
+    
+    res = await collection.update_one(
+        {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
+        {"$set": updated_data}
+    )
+    if res.matched_count == 0: raise HTTPException(status_code=404, detail="Candidate not found")
+    return {"status": "Updated successfully"}
+
+@app.put("/candidates/{candidate_id}/lock")
+async def toggle_lock(candidate_id: str, request: dict, current_user: dict = Depends(get_current_user)):
+    res = await collection.update_one(
+        {"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]}, 
+        {"$set": {"locked": request.get("locked", False)}}
+    )
+    if res.matched_count == 0: raise HTTPException(status_code=404, detail="Candidate not found")
+    return {"status": "success"}
+
+@app.post("/candidates/bulk-delete")
+async def bulk_delete_candidates(request: BulkDeleteRequest, current_user: dict = Depends(get_current_user)):
+    user_filter = {"uploaded_by": current_user["username"], "locked": {"$ne": True}}
+    
+    if request.candidate_ids:
+        user_filter["_id"] = {"$in": [ObjectId(cid) for cid in request.candidate_ids]}
+        
+    result = await collection.delete_many(user_filter)
+    return {"status": "success", "message": f"Deleted {result.deleted_count} candidates"}
+    
+@app.post("/candidates/{candidate_id}/retry")
+async def retry_parsing(candidate_id: str, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    candidate = await collection.find_one({"_id": ObjectId(candidate_id), "uploaded_by": current_user["username"]})
+    if not candidate: raise HTTPException(status_code=404, detail="Candidate not found")
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(candidate["cv_url"])
+    
+    background_tasks.add_task(
+        process_cv_background, response.content, candidate.get("file_name", "retry"), 
+        candidate["cv_url"], candidate_id, "application/pdf"
+    )
+    await collection.update_one({"_id": ObjectId(candidate_id)}, {"$set": {"status": "Processing"}})
+    return {"status": "success"}
     
 @app.post("/api/create-payment")
 async def create_khqr_payment(request: PaymentRequest):
-    package_id = request.package_id
-    email = request.email
-
-    packages = {
-        "small": {"price": 1.00, "credits": 20}, 
-        "pro":   {"price": 5.00, "credits": 150} 
-    }
+    packages = {"small": {"price": 1.00, "credits": 20}, "pro": {"price": 5.00, "credits": 150}}
+    if request.package_id not in packages: raise HTTPException(status_code=400, detail="Invalid package")
     
-    if package_id not in packages:
-        raise HTTPException(status_code=400, detail="Invalid package")
-    
-    pkg = packages[package_id]
-    
+    pkg = packages[request.package_id]
     bill_number = str(uuid.uuid4().int)[:10] 
 
-    qr_response = khqr.create_qr(
-        bank_account=BAKONG_ACCOUNT_ID,
-        merchant_name=MERCHANT_NAME,
-        merchant_city=MERCHANT_CITY,
-        amount=pkg["price"],
-        currency="USD", 
-        phone_number='85592886006',
-        store_label="CV Credits",
-        bill_number=bill_number,
-        terminal_label="POS-01"
-    )
+    try:
+        qr = khqr.create_qr(
+            bank_account=BAKONG_ACCOUNT_ID, merchant_name=MERCHANT_NAME, merchant_city=MERCHANT_CITY,
+            amount=pkg["price"], currency="USD", phone_number='85592886006',
+            store_label="CV Credits", bill_number=bill_number, terminal_label="POS-01"
+        )
+    except Exception as e:
+        logger.error(f"Bakong Error: {e}")
+        raise HTTPException(status_code=503, detail="Payment service unavailable")
     
-    qr_string = qr_response 
-    md5_hash = khqr.generate_md5(qr_string)
-
-    user = await users_collection.find_one({"username": email})
+    md5_hash = khqr.generate_md5(qr)
+    user = await users_collection.find_one({"username": request.email})
     if user:
         await transactions_collection.insert_one({
-            "user_id": user["_id"],
-            "amount": pkg["credits"],
-            "type": "PURCHASE_INTENT",
-            "status": "PENDING",
-            "payment_ref": bill_number,
-            "md5_hash": md5_hash,
-            "created_at": datetime.now().isoformat()
+            "user_id": user["_id"], "amount": pkg["credits"], "type": "PURCHASE_INTENT",
+            "status": "PENDING", "payment_ref": bill_number, "md5_hash": md5_hash, "created_at": datetime.now().isoformat()
         })
 
-    return {
-        "qr_code": qr_string, 
-        "md5": md5_hash,
-        "amount": pkg["price"]
-    }
+    return {"qr_code": qr, "md5": md5_hash, "amount": pkg["price"]}
     
 @app.post("/api/check-payment-status")
 async def check_payment_status(md5_hash: str):
-    """Checks if a specific transaction was paid using the Bakong API."""
     trx = await transactions_collection.find_one({"md5_hash": md5_hash})
-    
-    if not trx:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-        
-    if trx["status"] == "COMPLETED":
-        return {"status": "PAID", "message": "Already processed"}
+    if not trx: raise HTTPException(status_code=404, detail="Transaction not found")
+    if trx["status"] == "COMPLETED": return {"status": "PAID", "message": "Already processed"}
 
     try:
-        payment_status = khqr.check_payment(md5_hash)
-    except Exception as e:
-        print(f"Bakong Error: {e}")
-        raise HTTPException(status_code=500, detail="Cannot verify payment with Bank")
+        status_res = khqr.check_payment(md5_hash)
+    except:
+        return {"status": "PENDING", "detail": "Payment check busy"}
 
-    if payment_status == "PAID": 
+    if status_res == "PAID": 
         await transactions_collection.update_one(
-            {"_id": trx["_id"]},
-            {"$set": {"status": "COMPLETED", "paid_at": datetime.now().isoformat()}}
+            {"_id": trx["_id"]}, {"$set": {"status": "COMPLETED", "paid_at": datetime.now().isoformat()}}
         )
+        await add_credits(trx["user_id"], trx["amount"], f"Purchased Credits", md5_hash)
         
-        await add_credits(
-            user_id=trx["user_id"],
-            amount=trx["amount"],
-            reason=f"Purchased Credits (Ref: {trx['payment_ref']})",
-            ref=md5_hash
-        )
-        return {"status": "PAID", "new_credits": trx["amount"]}
+        updated_user = await users_collection.find_one({"_id": trx["user_id"]})
+        return {"status": "PAID", "new_credits": trx["amount"], "total_credits": updated_user.get("current_credits", 0)}
     
-    else:
-        return {"status": "UNPAID", "detail": "Payment not received yet"}
+    return {"status": "UNPAID"}
