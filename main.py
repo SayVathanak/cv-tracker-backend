@@ -86,31 +86,54 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # --- 2. BACKGROUND TASKS ---
 async def run_async_cleanup():
-    """Deletes old PDF files from Cloudinary to save space."""
-    logger.info("[Auto-Cleanup] Scanning for old files...")
-    cutoff_time = datetime.now() - timedelta(hours=24)
+    """
+    Deletes files ONLY for users who have enabled autoDelete in their settings.
+    Respects the specific retention period set by the user.
+    """
+    logger.info("[Auto-Cleanup] Scanning for files to delete...")
     
-    cursor = collection.find({
-        "upload_date": {"$lt": cutoff_time.isoformat()},
-        "cv_url": {"$ne": None}, 
-        "file_status": {"$ne": "Expired"}
-    })
-
-    async for candidate in cursor:
-        url = candidate.get("cv_url")
-        if not url or "http" not in url: continue 
-
+    # 1. Find all users who have enabled autoDelete
+    # Note: We look for users where settings.autoDelete is specifically true
+    async for user in users_collection.find({"settings.autoDelete": True}):
         try:
-            public_id = url.split('/')[-1].split('.')[0]
-            logger.info(f" -> Deleting PDF for: {candidate.get('Name')}")
-            cloudinary.uploader.destroy(public_id)
+            username = user.get("username")
+            settings = user.get("settings", {})
             
-            await collection.update_one(
-                {"_id": candidate["_id"]},
-                {"$set": {"cv_url": None, "file_status": "Expired"}}
-            )
+            # Get user's specific retention (default to 30 days if invalid)
+            try:
+                days = int(settings.get("retention", "30"))
+            except:
+                days = 30
+                
+            cutoff_time = datetime.now() - timedelta(days=days)
+            
+            # 2. Find files uploaded by THIS user that are older than the cutoff
+            cursor = collection.find({
+                "uploaded_by": username,
+                "upload_date": {"$lt": cutoff_time.isoformat()},
+                "cv_url": {"$ne": None}, 
+                "file_status": {"$ne": "Expired"},
+                "locked": {"$ne": True} # Never delete locked files
+            })
+
+            async for candidate in cursor:
+                url = candidate.get("cv_url")
+                if not url or "http" not in url: continue 
+
+                try:
+                    public_id = url.split('/')[-1].split('.')[0]
+                    logger.info(f" -> Deleting PDF for user {username}: {candidate.get('Name')}")
+                    cloudinary.uploader.destroy(public_id)
+                    
+                    await collection.update_one(
+                        {"_id": candidate["_id"]},
+                        {"$set": {"cv_url": None, "file_status": "Expired"}}
+                    )
+                except Exception as e:
+                    logger.error(f"Error cleaning {candidate.get('_id')}: {e}")
+                    
         except Exception as e:
-            logger.error(f"Error cleaning {candidate.get('_id')}: {e}")
+            logger.error(f"Error processing user {user.get('username')}: {e}")
 
 async def process_cv_background(file_content: bytes, filename: str, cv_url: str, candidate_id: str, mime_type: str):
     """
@@ -144,27 +167,29 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         
         prompt = """
         You are an expert HR Data Extractor for candidates in Cambodia.
-        Analyze the uploaded CV and extract details into a JSON object.
+        Analyze the uploaded CV (PDF or Image) and extract details into a strict JSON object.
 
-        ### 1. STANDARDIZATION RULES:
-        - **EducationLevel:** ['High School', 'Associate Degree', 'Bachelor Degree', 'Master Degree', 'PhD', 'Other'].
-        - **Gender:** ['Male', 'Female', 'N/A'].
+        ### 1. EXTRACTION RULES:
+        - **Name:** Full Name in Title Case (e.g., "Sokha Dara"). If name is in Khmer, Romanize it or keep it if standard.
+        - **Tel:** Standardize to "0xx xxx xxx" (e.g., 012 999 888). Remove +855 prefix if present.
+        - **Location:** Extract "City" or "District, City". If "Phnom Penh", just return "Phnom Penh".
+        - **School:** Extract the most recent University/Institute name only. Use acronyms if common (e.g., "RUPP", "ITC", "Setec").
+        - **EducationLevel:** Choose exactly one: ['High School', 'Associate', 'Bachelor', 'Master', 'PhD', 'Other'].
+        - **Gender:** ['Male', 'Female', 'N/A']. Infer from photo or name if not explicitly stated.
         
-        ### 2. LOCATION RULES:
-        - Format: "Sangkat [Name], Khan [Name]" or "City, Province".
-        - If only "Phnom Penh", return "Phnom Penh".
+        ### 2. EXPERIENCE SUMMARY (Crucial):
+        - Format: "Role at Company". 
+        - Example: "Sales Manager at ABC Co".
+        - If multiple jobs, take the MOST RECENT one.
+        - Max 10 words. Keep it short for a dashboard card.
+        - If Fresh Graduate, return "Fresh Graduate".
 
-        ### 3. CONFIDENCE (0-100):
-        - Rate confidence based on text clarity and field completeness.
+        ### 3. CONFIDENCE SCORE (0-100):
+        - 100 = Clear text, all fields found.
+        - 80 = Missing 1 minor field (e.g., Address).
+        - 50 = Scanned image, blurry, or missing key info like Tel/Name.
 
-        ### 4. DATA FIELDS:
-        - **Name:** Full Name (Title Case).
-        - **Tel:** "0xx xxx xxx" format.
-        - **Experience:** Summarize last job title & company (Max 15 words).
-        - **Position:** Role applied for.
-        - **School:** University Name only.
-
-        Return JSON:
+        Return strictly this JSON structure:
         {
             "Name": "String",
             "Tel": "String",
@@ -286,6 +311,13 @@ class GoogleAuthRequest(BaseModel):
 class PaymentRequest(BaseModel):
     package_id: str
     email: str
+    
+class UserSettings(BaseModel):
+    autoDelete: bool = False
+    retention: str = "30"
+    exportFields: dict = {}
+    autoTags: str = ""
+    profile: dict = {}
 
 # --- 5. HELPER FUNCTIONS ---
 def verify_password(plain_password, hashed_password):
@@ -378,7 +410,11 @@ async def google_login(request: GoogleAuthRequest):
 
 @app.get("/users/me")
 async def read_users_me(current_user: dict = Depends(get_current_user)):
-    return {"username": current_user["username"], "current_credits": current_user.get("current_credits", 0)}
+    return {
+        "username": current_user["username"],
+        "current_credits": current_user.get("current_credits", 0),
+        "settings": current_user.get("settings", {}) # Return saved settings
+    }
 
 @app.post("/upload-cv")
 async def upload_cv(
@@ -455,8 +491,15 @@ async def get_candidates(
     query_filter = {"uploaded_by": current_user["username"]}
     if search:
         search_regex = {"$regex": search, "$options": "i"}
+        # --- FIX: Added {"Position": search_regex} to the list below ---
         query_filter["$and"] = [{
-            "$or": [{"Name": search_regex}, {"Tel": search_regex}, {"School": search_regex}, {"Location": search_regex}]
+            "$or": [
+                {"Name": search_regex}, 
+                {"Tel": search_regex}, 
+                {"School": search_regex}, 
+                {"Location": search_regex},
+                {"Position": search_regex} 
+            ]
         }]
 
     total_count = await collection.count_documents(query_filter)
@@ -509,6 +552,15 @@ async def toggle_lock(candidate_id: str, request: dict, current_user: dict = Dep
     )
     if res.matched_count == 0: raise HTTPException(status_code=404, detail="Candidate not found")
     return {"status": "success"}
+
+@app.put("/users/settings")
+async def update_user_settings(settings: UserSettings, current_user: dict = Depends(get_current_user)):
+    settings_dict = settings.dict()
+    await users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {"settings": settings_dict}}
+    )
+    return {"status": "success", "settings": settings_dict}
 
 @app.post("/candidates/bulk-delete")
 async def bulk_delete_candidates(request: BulkDeleteRequest, current_user: dict = Depends(get_current_user)):
