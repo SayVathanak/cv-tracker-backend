@@ -367,6 +367,16 @@ async def add_credits(user_id, amount: int, reason: str, ref: str = None):
 async def start_scheduler():
     logger.info("--> System Startup: Checking for expired files...")
     await run_async_cleanup()
+    
+    # --- ONE-TIME DATA MIGRATION ---
+    # Ensure all users have a 'lifetime_uploads' field based on current files
+    async for user in users_collection.find({"lifetime_uploads": {"$exists": False}}):
+        current_count = await collection.count_documents({"uploaded_by": user["username"]})
+        await users_collection.update_one(
+            {"_id": user["_id"]}, 
+            {"$set": {"lifetime_uploads": current_count}}
+        )
+    logger.info("--> Data Migration: User lifetime counts initialized.")
 
 @app.post("/register", status_code=201)
 async def register(user: UserCreate):
@@ -445,7 +455,13 @@ async def upload_cv(
         )
 
     # Deduct credits
-    await users_collection.update_one({"_id": current_user["_id"]}, {"$inc": {"current_credits": -cost}})
+    # await users_collection.update_one({"_id": current_user["_id"]}, {"$inc": {"current_credits": -cost}})
+
+    # Deduct credits AND increment lifetime upload counter
+    await users_collection.update_one(
+        {"_id": current_user["_id"]}, 
+        {"$inc": {"current_credits": -cost, "lifetime_uploads": cost}}
+    )
     
     await transactions_collection.insert_one({
         "user_id": current_user["_id"], "amount": -cost, "type": "SPEND",
@@ -596,8 +612,15 @@ async def retry_parsing(candidate_id: str, background_tasks: BackgroundTasks, cu
     
 @app.post("/api/create-payment")
 async def create_khqr_payment(request: PaymentRequest):
-    packages = {"small": {"price": 1.00, "credits": 20}, "pro": {"price": 5.00, "credits": 150}}
-    if request.package_id not in packages: raise HTTPException(status_code=400, detail="Invalid package")
+    # --- UPDATED PRICING PACKAGES ---
+    packages = {
+        "mini":     {"price": 0.25, "credits": 15},
+        "standard": {"price": 1.50, "credits": 100},
+        "max":      {"price": 5.00, "credits": 400}
+    }
+    
+    if request.package_id not in packages: 
+        raise HTTPException(status_code=400, detail="Invalid package selected")
     
     pkg = packages[request.package_id]
     bill_number = str(uuid.uuid4().int)[:10] 
@@ -619,7 +642,7 @@ async def create_khqr_payment(request: PaymentRequest):
         await transactions_collection.insert_one({
             "user_id": user["_id"], 
             "amount": pkg["credits"], 
-            "price": pkg["price"],     # <--- NEW: Saving the dollar amount
+            "price": pkg["price"],     # Saving the exact dollar amount
             "type": "PURCHASE_INTENT",
             "status": "PENDING", 
             "payment_ref": bill_number, 
@@ -930,17 +953,22 @@ async def toggle_user_status(user_id: str, current_user: dict = Depends(verify_a
 
 @app.get("/admin/analytics")
 async def get_analytics(current_user: dict = Depends(verify_admin_access)):
-    # FIX: Calculate revenue from Users, NOT Transactions
-    # This ensures revenue data persists even if you delete transaction history.
-    pipeline = [
+    # 1. Revenue (Sum of lifetime_spend)
+    pipeline_revenue = [
         {"$group": {"_id": None, "total_revenue": {"$sum": "$lifetime_spend"}}}
     ]
-    revenue_cursor = users_collection.aggregate(pipeline)
-    revenue_result = await revenue_cursor.to_list(length=1)
-    total_revenue = revenue_result[0]["total_revenue"] if revenue_result else 0
+    revenue_res = await users_collection.aggregate(pipeline_revenue).to_list(length=1)
+    total_revenue = revenue_res[0]["total_revenue"] if revenue_res else 0
 
+    # 2. Total Files Processed (Sum of lifetime_uploads)
+    pipeline_uploads = [
+        {"$group": {"_id": None, "total_uploads": {"$sum": "$lifetime_uploads"}}}
+    ]
+    uploads_res = await users_collection.aggregate(pipeline_uploads).to_list(length=1)
+    total_files = uploads_res[0]["total_uploads"] if uploads_res else 0
+
+    # 3. Pending Reviews
     pending_count = await transactions_collection.count_documents({"status": "VERIFYING"})
-    total_files = await collection.count_documents({})
 
     return {
         "revenue": total_revenue,
