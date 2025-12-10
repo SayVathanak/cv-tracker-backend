@@ -612,15 +612,20 @@ async def create_khqr_payment(request: PaymentRequest):
     
     md5_hash = khqr.generate_md5(qr)
     user = await users_collection.find_one({"username": request.email})
+    
     if user:
         await transactions_collection.insert_one({
-            "user_id": user["_id"], "amount": pkg["credits"], "type": "PURCHASE_INTENT",
-            "status": "PENDING", "payment_ref": bill_number, "md5_hash": md5_hash, "created_at": datetime.now().isoformat()
+            "user_id": user["_id"], 
+            "amount": pkg["credits"], 
+            "price": pkg["price"],     # <--- NEW: Saving the dollar amount
+            "type": "PURCHASE_INTENT",
+            "status": "PENDING", 
+            "payment_ref": bill_number, 
+            "md5_hash": md5_hash, 
+            "created_at": datetime.now().isoformat()
         })
 
     return {"qr_code": qr, "md5": md5_hash, "amount": pkg["price"]}
-    
-# Search for this endpoint in main.py and REPLACE it with this version:
 
 @app.post("/api/check-payment-status")
 async def check_payment_status(md5_hash: str, force: bool = Query(False)):
@@ -876,3 +881,96 @@ async def get_admin_stats(admin_user: dict = Depends(verify_admin_access)):
         "unique_roles": 4,
         "message": f"Hello Admin {admin_user.get('username')}, here is your secret data."
     }
+    
+#
+
+@app.get("/admin/users")
+async def get_all_users(current_user: dict = Depends(verify_admin_access)):
+    """List all users with their stats"""
+    cursor = users_collection.find()
+    users = []
+    async for user in cursor:
+        # Count their uploads
+        upload_count = await collection.count_documents({"uploaded_by": user["username"]})
+        users.append({
+            "id": str(user["_id"]),
+            "username": user["username"],
+            "credits": user.get("current_credits", 0),
+            "joined_at": user.get("created_at"),
+            "uploads": upload_count,
+            "is_active": user.get("is_active", True) # Default to True
+        })
+    return users
+
+@app.put("/admin/users/{user_id}/toggle-status")
+async def toggle_user_status(user_id: str, current_user: dict = Depends(verify_admin_access)):
+    """Ban or Unban a user"""
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user: raise HTTPException(404, "User not found")
+    
+    new_status = not user.get("is_active", True)
+    await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_active": new_status}})
+    
+    return {"status": "success", "is_active": new_status}
+
+#
+
+@app.get("/admin/analytics")
+async def get_analytics(current_user: dict = Depends(verify_admin_access)):
+    # 1. Calculate Total Revenue (USD) with Hybrid Logic
+    pipeline = [
+        {"$match": {"status": "COMPLETED", "type": "PURCHASE_INTENT"}}, 
+        {"$group": {
+            "_id": None, 
+            "total_revenue": {
+                "$sum": {
+                    # LOGIC: Check if 'price' field exists (New data). 
+                    # If not, calculate based on 'amount' credits (Old data).
+                    "$ifNull": [
+                        "$price", 
+                        {
+                            "$switch": {
+                                "branches": [
+                                    {"case": {"$eq": ["$amount", 20]}, "then": 1.00},
+                                    {"case": {"$eq": ["$amount", 150]}, "then": 5.00}
+                                ],
+                                "default": 0
+                            }
+                        }
+                    ]
+                }
+            }
+        }}
+    ]
+    
+    revenue_cursor = transactions_collection.aggregate(pipeline)
+    revenue_result = await revenue_cursor.to_list(length=1)
+    total_revenue = revenue_result[0]["total_revenue"] if revenue_result else 0
+
+    # 2. Count Pending Approvals
+    pending_count = await transactions_collection.count_documents({"status": "VERIFYING"})
+
+    # 3. Total Files Processed
+    total_files = await collection.count_documents({})
+
+    return {
+        "revenue": total_revenue,
+        "pending_reviews": pending_count,
+        "total_files_parsed": total_files
+    }
+
+@app.get("/admin/failed-parsings")
+async def get_failed_parsings(current_user: dict = Depends(verify_admin_access)):
+    """Get a list of all files that failed AI processing"""
+    cursor = collection.find({"status": "Error"}).sort("upload_date", -1).limit(50)
+    failed_files = []
+    async for doc in cursor:
+        failed_files.append({
+            "id": str(doc["_id"]),
+            "file_name": doc.get("file_name"),
+            "uploaded_by": doc.get("uploaded_by"),
+            "error_msg": doc.get("error_msg"), # This stores why it failed
+            "upload_date": doc.get("upload_date"),
+            "cv_url": doc.get("cv_url")
+        })
+    return failed_files
