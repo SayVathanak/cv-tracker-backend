@@ -13,4 +13,4 @@ bakong-khqr
 apscheduler
 google-auth
 requests
-bcrypt
+bcrypt==3.2.0
