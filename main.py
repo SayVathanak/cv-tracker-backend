@@ -257,6 +257,8 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
 # --- 3. APP INITIALIZATION & GLOBAL HANDLERS ---
 app = FastAPI()
 
+ADMIN_EMAILS = ["saksovathanaksay@gmail.com"]
+
 # Handler 1: Catch Known HTTP Exceptions (like 402 Insufficient Credits)
 # This allows the specific "detail" message to reach the frontend.
 @app.exception_handler(HTTPException)
@@ -311,6 +313,9 @@ class GoogleAuthRequest(BaseModel):
 class PaymentRequest(BaseModel):
     package_id: str
     email: str
+    
+class PaymentProof(BaseModel):
+    transaction_id: str
     
 class UserSettings(BaseModel):
     autoDelete: bool = False
@@ -735,3 +740,139 @@ async def admin_add_credits(username: str, amount: int):
     
     return {"status": "success", "message": f"Added {amount} credits to {username}"}
 
+@app.post("/api/submit-payment-proof")
+async def submit_payment_proof(
+    background_tasks: BackgroundTasks,
+    md5_hash: str = Query(...), 
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    User uploads a screenshot of their transaction.
+    """
+    # 1. Verify transaction exists and belongs to user
+    trx = await transactions_collection.find_one({
+        "md5_hash": md5_hash, 
+        "user_id": current_user["_id"]
+    })
+    
+    if not trx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    # 2. Upload Proof to Cloudinary
+    try:
+        content = await file.read()
+        # Upload to a specific folder 'payment_proofs'
+        upload_result = cloudinary.uploader.upload(
+            content, 
+            folder="payment_proofs",
+            resource_type="image"
+        )
+        proof_url = upload_result.get("secure_url")
+    except Exception as e:
+        logger.error(f"Proof Upload Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload proof image")
+
+    # 3. Update Transaction Status
+    await transactions_collection.update_one(
+        {"_id": trx["_id"]},
+        {
+            "$set": {
+                "status": "VERIFYING",  # New status
+                "proof_url": proof_url,
+                "submitted_at": datetime.now().isoformat()
+            }
+        }
+    )
+    
+    return {"status": "success", "message": "Proof submitted for review"}
+
+
+@app.get("/admin/pending-transactions")
+async def get_pending_transactions(current_user: dict = Depends(get_current_user)):
+    """
+    Fetch only transactions waiting for approval.
+    """
+    # TODO: Add specific Admin check here if needed (e.g., if current_user['username'] != 'admin')
+    
+    cursor = transactions_collection.find({"status": "VERIFYING"}).sort("submitted_at", -1)
+    results = []
+    
+    async for trx in cursor:
+        user = await users_collection.find_one({"_id": trx["user_id"]})
+        results.append({
+            "id": str(trx["_id"]),
+            "username": user.get("username", "Unknown"),
+            "amount": trx["amount"],
+            "payment_ref": trx.get("payment_ref"), # The Bill Number
+            "proof_url": trx.get("proof_url"),
+            "submitted_at": trx.get("submitted_at"),
+            "md5_hash": trx.get("md5_hash")
+        })
+        
+    return results
+
+
+@app.post("/admin/process-transaction/{transaction_id}")
+async def process_transaction(
+    transaction_id: str, 
+    action: str = Query(..., regex="^(APPROVE|REJECT)$"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Admin: Approve or Reject a payment.
+    """
+    trx = await transactions_collection.find_one({"_id": ObjectId(transaction_id)})
+    if not trx: raise HTTPException(status_code=404, detail="Transaction not found")
+    
+    if trx["status"] == "COMPLETED":
+        return {"status": "error", "message": "Already completed"}
+
+    if action == "APPROVE":
+        # Add Credits
+        await add_credits(
+            trx["user_id"], 
+            trx["amount"], 
+            f"Top-up Approved (Ref: {trx.get('payment_ref')})", 
+            trx.get("md5_hash")
+        )
+        # Mark Complete
+        await transactions_collection.update_one(
+            {"_id": trx["_id"]}, 
+            {"$set": {"status": "COMPLETED", "reviewed_by": current_user["username"], "reviewed_at": datetime.now().isoformat()}}
+        )
+        return {"status": "success", "message": "Payment Approved & Credits Added"}
+    
+    else: # REJECT
+        await transactions_collection.update_one(
+            {"_id": trx["_id"]}, 
+            {"$set": {"status": "REJECTED", "reviewed_by": current_user["username"], "reviewed_at": datetime.now().isoformat()}}
+        )
+        return {"status": "success", "message": "Payment Rejected"}
+    
+def verify_admin_access(current_user: dict = Depends(get_current_user)):
+    """
+    Dependency that fails if the user is not an admin.
+    """
+    # Adjust 'username' to match your actual user model field (e.g. user.email or user['username'])
+    user_email = current_user.get("username") 
+    
+    if user_email not in ADMIN_EMAILS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="You do not have permission to access the Admin Panel."
+        )
+    return current_user
+
+
+# 3. PROTECT YOUR ADMIN ROUTES
+@app.get("/admin/dashboard-stats")
+async def get_admin_stats(admin_user: dict = Depends(verify_admin_access)):
+    # Only "saksovathanaksay@gmail.com" can reach this code.
+    # Regular users will get a 403 Error automatically.
+    
+    return {
+        "total_candidates": 20,
+        "unique_roles": 4,
+        "message": f"Hello Admin {admin_user.get('username')}, here is your secret data."
+    }
