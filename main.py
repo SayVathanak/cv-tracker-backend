@@ -428,9 +428,10 @@ async def google_login(request: GoogleAuthRequest):
 @app.get("/users/me")
 async def read_users_me(current_user: dict = Depends(get_current_user)):
     return {
+        "id": str(current_user["_id"]),
         "username": current_user["username"],
         "current_credits": current_user.get("current_credits", 0),
-        "settings": current_user.get("settings", {}) # Return saved settings
+        "settings": current_user.get("settings", {}) 
     }
 
 @app.post("/upload-cv")
@@ -948,6 +949,27 @@ async def toggle_user_status(user_id: str, current_user: dict = Depends(verify_a
     await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_active": new_status}})
     
     return {"status": "success", "is_active": new_status}
+
+@app.delete("/admin/users/{user_id}")
+async def delete_user(user_id: str, current_user: dict = Depends(verify_admin_access)):
+    """Permanently delete a user and their associated data"""
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user: 
+        raise HTTPException(404, "User not found")
+    
+    # Optional: Prevent deleting yourself (the admin)
+    if user["username"] == current_user["username"]:
+        raise HTTPException(400, "You cannot delete your own admin account.")
+
+    # 1. Delete User Record
+    await users_collection.delete_one({"_id": ObjectId(user_id)})
+    
+    # 2. (Optional) Cleanup their files or keep them as "orphaned" for records
+    # For a full clean delete:
+    # await collection.delete_many({"uploaded_by": user["username"]})
+    # await transactions_collection.delete_many({"user_id": ObjectId(user_id)})
+
+    return {"status": "success", "message": f"User {user['username']} deleted permanently."}
 
 #
 
