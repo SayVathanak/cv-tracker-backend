@@ -377,6 +377,7 @@ async def register(user: UserCreate):
         "username": user.username,
         "hashed_password": get_password_hash(user.password),
         "current_credits": 0,
+        "lifetime_spend": 0,
         "created_at": datetime.now().isoformat(),
         "provider": "local"
     }
@@ -403,7 +404,8 @@ async def google_login(request: GoogleAuthRequest):
         if not user:
             result = await users_collection.insert_one({
                 "username": email, "hashed_password": "GOOGLE_AUTH_USER",
-                "provider": "google", "created_at": datetime.now().isoformat(), "current_credits": 0
+                "provider": "google", "created_at": datetime.now().isoformat(), "current_credits": 0,
+                "lifetime_spend": 0
             })
             await add_credits(result.inserted_id, 10, "Welcome Gift", "SIGNUP_BONUS")
         
@@ -693,26 +695,29 @@ async def check_payment_status(md5_hash: str, force: bool = Query(False)):
 @app.get("/admin/transactions")
 async def get_all_transactions(current_user: dict = Depends(get_current_user)):
     """
-    Fetches the last 50 transactions for the Admin Panel.
+    Fetches transactions but HIDES 'Pending' ones to prevent spam logs.
     """
-    # In a real app, add check: if current_user["role"] != "admin": raise ...
+    # FIX: Only show transactions that are VERIFYING or COMPLETED. 
+    # Hide the 'PENDING' ones (which are just clicks without payment).
+    filter_query = {"status": {"$in": ["VERIFYING", "COMPLETED", "REJECTED"]}}
     
-    cursor = transactions_collection.find().sort("created_at", -1).limit(50)
+    cursor = transactions_collection.find(filter_query).sort("created_at", -1).limit(50)
     transactions = []
     
     async for trx in cursor:
-        # Get username for context
         user = await users_collection.find_one({"_id": trx["user_id"]})
         username = user["username"] if user else "Unknown"
         
         transactions.append({
             "id": str(trx["_id"]),
             "username": username,
-            "amount": trx["amount"],
+            "amount": trx["amount"],      # Credits (e.g., 20)
+            "price": trx.get("price", 0), # Money (e.g., 1.00) << IMPORTANT
             "type": trx["type"],
-            "status": trx["status"], # PENDING, COMPLETED
+            "status": trx["status"],
             "md5_hash": trx.get("md5_hash"),
             "payment_ref": trx.get("payment_ref"),
+            "proof_url": trx.get("proof_url"), # Added proof URL for Admin
             "created_at": trx["created_at"]
         })
         
@@ -817,16 +822,12 @@ async def get_pending_transactions(current_user: dict = Depends(get_current_user
         
     return results
 
-
 @app.post("/admin/process-transaction/{transaction_id}")
 async def process_transaction(
     transaction_id: str, 
     action: str = Query(..., regex="^(APPROVE|REJECT)$"),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Admin: Approve or Reject a payment.
-    """
     trx = await transactions_collection.find_one({"_id": ObjectId(transaction_id)})
     if not trx: raise HTTPException(status_code=404, detail="Transaction not found")
     
@@ -841,7 +842,19 @@ async def process_transaction(
             f"Top-up Approved (Ref: {trx.get('payment_ref')})", 
             trx.get("md5_hash")
         )
-        # Mark Complete
+        
+        # FIX: Save the money amount permanently to the USER profile
+        # This prevents revenue from dropping to $0 when logs are cleared.
+        money_amount = trx.get("price", 0) 
+        # Fallback for old records
+        if money_amount == 0 and trx["amount"] == 20: money_amount = 1.00 
+        if money_amount == 0 and trx["amount"] == 150: money_amount = 5.00
+
+        await users_collection.update_one(
+            {"_id": trx["user_id"]}, 
+            {"$inc": {"lifetime_spend": money_amount}} # <--- PERMANENT RECORD
+        )
+
         await transactions_collection.update_one(
             {"_id": trx["_id"]}, 
             {"$set": {"status": "COMPLETED", "reviewed_by": current_user["username"], "reviewed_at": datetime.now().isoformat()}}
@@ -917,40 +930,16 @@ async def toggle_user_status(user_id: str, current_user: dict = Depends(verify_a
 
 @app.get("/admin/analytics")
 async def get_analytics(current_user: dict = Depends(verify_admin_access)):
-    # 1. Calculate Total Revenue (USD) with Hybrid Logic
+    # FIX: Calculate revenue from Users, NOT Transactions
+    # This ensures revenue data persists even if you delete transaction history.
     pipeline = [
-        {"$match": {"status": "COMPLETED", "type": "PURCHASE_INTENT"}}, 
-        {"$group": {
-            "_id": None, 
-            "total_revenue": {
-                "$sum": {
-                    # LOGIC: Check if 'price' field exists (New data). 
-                    # If not, calculate based on 'amount' credits (Old data).
-                    "$ifNull": [
-                        "$price", 
-                        {
-                            "$switch": {
-                                "branches": [
-                                    {"case": {"$eq": ["$amount", 20]}, "then": 1.00},
-                                    {"case": {"$eq": ["$amount", 150]}, "then": 5.00}
-                                ],
-                                "default": 0
-                            }
-                        }
-                    ]
-                }
-            }
-        }}
+        {"$group": {"_id": None, "total_revenue": {"$sum": "$lifetime_spend"}}}
     ]
-    
-    revenue_cursor = transactions_collection.aggregate(pipeline)
+    revenue_cursor = users_collection.aggregate(pipeline)
     revenue_result = await revenue_cursor.to_list(length=1)
     total_revenue = revenue_result[0]["total_revenue"] if revenue_result else 0
 
-    # 2. Count Pending Approvals
     pending_count = await transactions_collection.count_documents({"status": "VERIFYING"})
-
-    # 3. Total Files Processed
     total_files = await collection.count_documents({})
 
     return {
