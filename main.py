@@ -164,16 +164,18 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             raise Exception("Gemini failed to process the file media.")
 
         model = genai.GenerativeModel('gemini-2.0-flash', generation_config={"response_mime_type": "application/json"})
-        
+
         prompt = """
         You are an expert HR Data Extractor for candidates in Cambodia.
         Analyze the uploaded CV (PDF or Image) and extract details into a strict JSON object.
-
+        
         ### 1. EXTRACTION RULES:
-        - **Name:** Full Name in Title Case (e.g., "Sokha Dara"). If name is in Khmer, Romanize it or keep it if standard.
+        - **Name:** Full Name in Title Case (e.g., "Sokha Dara"). If the name is in Khmer, **Romanize it into Latin script** using standard Cambodian transliteration. Keep it in Khmer only if Romanization is not possible.
         - **Tel:** Standardize to "0xx xxx xxx" (e.g., 012 999 888). Remove +855 prefix if present.
-        - **Location:** Extract "City" or "District, City". If "Phnom Penh", just return "Phnom Penh".
-        - **School:** Extract the most recent University/Institute name only. Use acronyms if common (e.g., "RUPP", "ITC", "Setec").
+        - **Location:** Extract the **full detailed address** in the format "Sangkat [name], Khan [name], City/Province". 
+          - If the CV only mentions the city (e.g., Phnom Penh), just return "Phnom Penh".  
+          - If the CV has Khmer address text (e.g., សង្កាត់, ខណ្ឌ), **Romanize it** into Latin script.
+        - **School:** Extract the most recent University/Institute name only. Use acronyms if common (e.g., "RUPP", "ITC", "Setec"). Romanize if written in Khmer.
         - **EducationLevel:** Choose exactly one: ['High School', 'Associate', 'Bachelor', 'Master', 'PhD', 'Other'].
         - **Gender:** ['Male', 'Female', 'N/A']. Infer from photo or name if not explicitly stated.
         
@@ -183,12 +185,15 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         - If multiple jobs, take the MOST RECENT one.
         - Max 10 words. Keep it short for a dashboard card.
         - If Fresh Graduate, return "Fresh Graduate".
-
+        
         ### 3. CONFIDENCE SCORE (0-100):
         - 100 = Clear text, all fields found.
         - 80 = Missing 1 minor field (e.g., Address).
         - 50 = Scanned image, blurry, or missing key info like Tel/Name.
-
+        
+        ### 4. ROMANIZATION RULE:
+        - **All Khmer text** in Name, Location, and School should be converted to standard Romanized Latin script unless impossible.
+        
         Return strictly this JSON structure:
         {
             "Name": "String",
