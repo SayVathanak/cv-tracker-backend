@@ -166,46 +166,43 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         model = genai.GenerativeModel('gemini-2.0-flash', generation_config={"response_mime_type": "application/json"})
 
         prompt = """
-        You are an expert HR Data Extractor for candidates in Cambodia.
-        Analyze the uploaded CV (PDF or Image) and extract details into a strict JSON object.
-        
-        ### 1. EXTRACTION RULES:
-        - **Name:** Full Name in Title Case (e.g., "Sokha Dara"). If the name is in Khmer, **Romanize it into Latin script** using standard Cambodian transliteration. Keep it in Khmer only if Romanization is not possible.
-        - **Tel:** Standardize to "0xx xxx xxx" (e.g., 012 999 888). Remove +855 prefix if present.
-        - **Location:** Extract the **full detailed address** in the format "Sangkat [name], Khan [name], City/Province". 
-          - If the CV only mentions the city (e.g., Phnom Penh), just return "Phnom Penh".  
-          - If the CV has Khmer address text (e.g., សង្កាត់, ខណ្ឌ), **Romanize it** into Latin script.
-        - **School:** Extract the most recent University/Institute name only. Use acronyms if common (e.g., "RUPP", "ITC", "Setec"). Romanize if written in Khmer.
-        - **EducationLevel:** Choose exactly one: ['High School', 'Associate', 'Bachelor', 'Master', 'PhD', 'Other'].
-        - **Gender:** ['Male', 'Female', 'N/A']. Infer from photo or name if not explicitly stated.
-        
-        ### 2. EXPERIENCE SUMMARY (Crucial):
-        - Format: "Role at Company". 
-        - Example: "Sales Manager at ABC Co".
-        - If multiple jobs, take the MOST RECENT one.
-        - Max 10 words. Keep it short for a dashboard card.
-        - If Fresh Graduate, return "Fresh Graduate".
-        
-        ### 3. CONFIDENCE SCORE (0-100):
-        - 100 = Clear text, all fields found.
-        - 80 = Missing 1 minor field (e.g., Address).
-        - 50 = Scanned image, blurry, or missing key info like Tel/Name.
-        
-        ### 4. ROMANIZATION RULE:
-        - **All Khmer text** in Name, Location, and School should be converted to standard Romanized Latin script unless impossible.
-        
+        You are an expert HR Data Analyst specializing in the Cambodian labor market. 
+        Your task is to extract data from CVs that may have poor spelling, no spacing, or mixed Khmer/English text.
+
+        ### 1. ADDRESS NORMALIZATION & CORRECTION (CRITICAL)
+        Cambodia has 25 Provinces, 209 Districts (Khans), and 1,646 Communes (Sangkats). 
+        - **Correction:** If the candidate writes "beung salang" or "Beoung Salang", you must correct it to the official standard: "Sangkat Boeung Salang, Khan Tuol Kouk, Phnom Penh".
+        - **Structure:** Always return addresses in this exact order: "Sangkat [Name], Khan/Srok [Name], [City/Province]".
+        - **No Spacing Fix:** If text is "stengmeanchey", correct it to "Sangkat Steung Meanchey".
+        - **Common Mappings:**
+            - "toul kork" -> "Khan Tuol Kouk"
+            - "chamkarmon" -> "Khan Chamkar Mon"
+            - "sen sok" -> "Khan Sen Sok"
+            - "beoung keng kang" -> "Sangkat Boeung Keng Kang"
+        - **Inference:** If only a Sangkat is mentioned, infer the Khan and Province (e.g., "Phsar Thmey" is in "Khan Daun Penh, Phnom Penh").
+
+        ### 2. DATA EXTRACTION RULES
+        - **Name:** Romanize Khmer names (e.g., "សខា" -> "Sokha"). Use Title Case. Fix messy casing (e.g., "sOkHa dARA" -> "Sokha Dara").
+        - **Tel:** Standardize to "0xx xxx xxx". Remove "+855". If the user wrote "012-33-44-55", convert to "012 334 455".
+        - **School:** Use official names or well-known acronyms (RUPP, ITC, NUM, RULE, SETEC). Correct misspellings (e.g., "RUP" -> "RUPP").
+        - **Experience:** Summarize as "Role at Company". If the writing is bad (e.g., "i work at coffee shop before for 2 year"), clean it to "Barista at Coffee Shop".
+        - **EducationLevel:** Must be one of: ['High School', 'Associate', 'Bachelor', 'Master', 'PhD', 'Other'].
+
+        ### 3. HANDLING "BAD" WRITING
+        If the CV has poor grammar or spelling, use your knowledge of the Cambodian context to "best-guess" the intended meaning so the data matches other high-quality candidates. 
+
         Return strictly this JSON structure:
         {
-            "Name": "String",
-            "Tel": "String",
-            "Location": "String",
-            "School": "String",
-            "EducationLevel": "String",
-            "Experience": "String",
-            "Gender": "String",
+            "Name": "Standardized Name",
+            "Tel": "0xx xxx xxx",
+            "Location": "Sangkat ..., Khan ..., City/Province",
+            "School": "Standardized School Name",
+            "EducationLevel": "Level",
+            "Experience": "Clean Role at Company",
+            "Gender": "Male/Female/N/A",
             "BirthDate": "DD-Mon-YYYY",
-            "Position": "String",
-            "Confidence": Integer
+            "Position": "Target Job Title",
+            "Confidence": Integer (0-100)
         }
         """
         
