@@ -12,6 +12,8 @@ import uuid
 
 # Web Framework
 from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Response, Depends, HTTPException, status, Request
+from docx import Document
+from pptx import Presentation
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -135,12 +137,37 @@ async def run_async_cleanup():
         except Exception as e:
             logger.error(f"Error processing user {user.get('username')}: {e}")
 
+# --- HELPER: EXTRACT TEXT FROM OFFICE FILES ---
+def extract_text_from_office(file_path: str, ext: str) -> str:
+    text_content = []
+    try:
+        if ext == ".docx":
+            doc = Document(file_path)
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    text_content.append(para.text)
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            text_content.append(cell.text)
+                        
+        elif ext == ".pptx":
+            prs = Presentation(file_path)
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text.strip():
+                        text_content.append(shape.text)
+    except Exception as e:
+        logger.error(f"Text Extraction Error: {e}")
+        return ""
+    return "\n".join(text_content)
+
 async def process_cv_background(file_content: bytes, filename: str, cv_url: str, candidate_id: str, mime_type: str):
     """
     Background Task: 
-    1. Uploads file to Gemini
-    2. Extracts Data using AI
-    3. Updates MongoDB with results or error message
+    1. Handles PDF/Images via Gemini Vision (File API).
+    2. Handles DOCX/PPTX via Text Extraction -> Gemini Text Prompt.
     """
     temp_path = None
     gemini_file = None
@@ -148,23 +175,20 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
     try:
         logger.info(f"[{filename}] 🚀 Started AI processing...")
 
-        suffix = ".pdf" if mime_type == "application/pdf" else ".jpg"
+        # Determine file extension mapping
+        suffix = ".bin"
+        if "pdf" in mime_type: suffix = ".pdf"
+        elif "image" in mime_type: suffix = ".jpg" # Covers png/jpg
+        elif "word" in mime_type or filename.endswith(".docx"): suffix = ".docx"
+        elif "presentation" in mime_type or filename.endswith(".pptx"): suffix = ".pptx"
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_content)
             temp_path = tmp.name
 
-        gemini_file = genai.upload_file(path=temp_path, mime_type=mime_type)
-
-        # Wait for Gemini processing
-        while gemini_file.state.name == "PROCESSING":
-            await asyncio.sleep(1)
-            gemini_file = genai.get_file(gemini_file.name)
-
-        if gemini_file.state.name == "FAILED":
-            raise Exception("Gemini failed to process the file media.")
-
         model = genai.GenerativeModel('gemini-2.0-flash', generation_config={"response_mime_type": "application/json"})
 
+        # --- EXACT PROMPT FROM YOUR ORIGINAL CODE ---
         prompt = """
         You are an expert HR Data Analyst specializing in the Cambodian labor market. 
         Your task is to extract data from CVs that may have poor spelling, no spacing, or mixed Khmer/English text.
@@ -206,7 +230,35 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
         }
         """
         
-        response = await model.generate_content_async([gemini_file, prompt])
+        # --- BRANCH LOGIC ---
+        
+        is_office_doc = suffix in [".docx", ".pptx"]
+        final_prompt = []
+        
+        if is_office_doc:
+            # STRATEGY A: Text Extraction (Better for Office files)
+            extracted_text = extract_text_from_office(temp_path, suffix)
+            if not extracted_text.strip():
+                raise Exception("Could not extract text from Office document.")
+            
+            final_prompt = [f"{prompt}\n\nHere is the text extracted from the CV:\n{extracted_text}"]
+            
+        else:
+            # STRATEGY B: Vision/PDF API (Better for PDFs/Images)
+            gemini_file = genai.upload_file(path=temp_path, mime_type=mime_type)
+            
+            # Wait for Gemini processing
+            while gemini_file.state.name == "PROCESSING":
+                await asyncio.sleep(1)
+                gemini_file = genai.get_file(gemini_file.name)
+
+            if gemini_file.state.name == "FAILED":
+                raise Exception("Gemini failed to process the file media.")
+                
+            final_prompt = [gemini_file, prompt]
+
+        # Generate Content
+        response = await model.generate_content_async(final_prompt)
         
         try:
             json_text = response.text.replace("```json", "").replace("```", "").strip()
