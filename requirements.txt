@@ -6,7 +6,7 @@ python-pptx
 httpx
 motor
 cloudinary
-google-generativeai
+google-genai
 python-jose[cryptography]
 passlib[bcrypt]
 python-dotenv
