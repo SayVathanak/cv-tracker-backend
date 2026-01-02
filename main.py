@@ -11,7 +11,7 @@ import traceback
 import uuid
 
 # Web Framework
-from fastapi import FastAPI, UploadFile, File, Query, BackgroundTasks, Response, Depends, HTTPException, status, Request
+from fastapi import FastAPI, UploadFile, File, Query, Form, BackgroundTasks, Response, Depends, HTTPException, status, Request
 from docx import Document
 from pptx import Presentation
 from fastapi.responses import JSONResponse
@@ -36,7 +36,9 @@ from bson import ObjectId
 from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
-import google.generativeai as genai
+# import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # --- 1. LOGGING & CONFIGURATION ---
 load_dotenv()
@@ -55,7 +57,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     logger.error("No GEMINI_API_KEY found. Application may not function correctly.")
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 cloudinary.config( 
   cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"), 
@@ -66,11 +68,12 @@ cloudinary.config(
 
 # Database Setup
 MONGO_URL = os.getenv("MONGO_URL")
-client = AsyncIOMotorClient(MONGO_URL)
-db = client.cv_tracking_db
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db = mongo_client.cv_tracking_db
 collection = db.candidates
 users_collection = db["users"]
 transactions_collection = db["transactions"]
+folders_collection = db["folders"] # --- NEW COLLECTION ---
 
 # Payment Setup
 BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NjQ5NTIyNDksImV4cCI6MTc3MjcyODI0OX0.tbhgtVlzNrTGhD0mKkN33BgopmENupueM7qa9DsDxOI"
@@ -186,8 +189,6 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             tmp.write(file_content)
             temp_path = tmp.name
 
-        model = genai.GenerativeModel('gemini-2.0-flash', generation_config={"response_mime_type": "application/json"})
-
         # --- EXACT PROMPT FROM YOUR ORIGINAL CODE ---
         prompt = """
         You are an expert HR Data Analyst specializing in the Cambodian labor market. 
@@ -245,12 +246,12 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             
         else:
             # STRATEGY B: Vision/PDF API (Better for PDFs/Images)
-            gemini_file = genai.upload_file(path=temp_path, mime_type=mime_type)
+            gemini_file = client.files.upload(file=temp_path, config=types.UploadFileConfig(mime_type=mime_type))
             
             # Wait for Gemini processing
             while gemini_file.state.name == "PROCESSING":
                 await asyncio.sleep(1)
-                gemini_file = genai.get_file(gemini_file.name)
+                gemini_file = client.files.get(name=gemini_file.name)
 
             if gemini_file.state.name == "FAILED":
                 raise Exception("Gemini failed to process the file media.")
@@ -258,7 +259,13 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             final_prompt = [gemini_file, prompt]
 
         # Generate Content
-        response = await model.generate_content_async(final_prompt)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=final_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json'
+            )
+        )
         
         try:
             json_text = response.text.replace("```json", "").replace("```", "").strip()
@@ -305,7 +312,7 @@ async def process_cv_background(file_content: bytes, filename: str, cv_url: str,
             try: os.remove(temp_path)
             except: pass
         if gemini_file:
-            try: genai.delete_file(gemini_file.name)
+            try: client.files.delete(name=gemini_file.name)
             except: pass
 
 # --- 3. APP INITIALIZATION & GLOBAL HANDLERS ---
@@ -377,6 +384,13 @@ class UserSettings(BaseModel):
     exportFields: dict = {}
     autoTags: str = ""
     profile: dict = {}
+
+class FolderCreate(BaseModel): # --- NEW MODEL ---
+    name: str
+
+class MoveRequest(BaseModel):
+    candidate_ids: List[str]
+    folder_id: Optional[str] = None # None = Move to "All Candidates" (No Folder)
 
 # --- 5. HELPER FUNCTIONS ---
 def verify_password(plain_password, hashed_password):
@@ -488,10 +502,84 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
         "settings": current_user.get("settings", {}) 
     }
 
+# --- NEW FOLDER ENDPOINTS ---
+
+@app.post("/folders")
+async def create_folder(folder: FolderCreate, current_user: dict = Depends(get_current_user)):
+    """Create a new folder for the user"""
+    new_folder = {
+        "user_id": current_user["_id"],
+        "name": folder.name,
+        "created_at": datetime.now().isoformat(),
+    }
+    result = await folders_collection.insert_one(new_folder)
+    return {"status": "success", "id": str(result.inserted_id), "name": folder.name}
+
+@app.get("/folders")
+async def get_folders(current_user: dict = Depends(get_current_user)):
+    """Get all folders with dynamic candidate counts"""
+    cursor = folders_collection.find({"user_id": current_user["_id"]}).sort("created_at", -1)
+    folders = []
+    
+    async for folder in cursor:
+        # Calculate count for this folder
+        count = await collection.count_documents({
+            "uploaded_by": current_user["username"], 
+            "folder_id": str(folder["_id"])
+        })
+        
+        folders.append({
+            "id": str(folder["_id"]),
+            "name": folder["name"],
+            "count": count,
+            "created_at": folder["created_at"]
+        })
+    return folders
+
+@app.delete("/folders/{folder_id}")
+async def delete_folder(folder_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete folder AND all candidates inside it"""
+    # 1. Verify ownership
+    folder = await folders_collection.find_one({"_id": ObjectId(folder_id), "user_id": current_user["_id"]})
+    if not folder: raise HTTPException(status_code=404, detail="Folder not found")
+
+    # 2. Delete the folder
+    await folders_collection.delete_one({"_id": ObjectId(folder_id)})
+
+    # 3. Delete candidates inside this folder
+    # In a full production app, you might also want to delete Cloudinary files here.
+    await collection.delete_many({"folder_id": folder_id, "uploaded_by": current_user["username"]})
+    
+    return {"status": "success", "message": "Folder and contents deleted"}
+
+@app.post("/candidates/move")
+async def move_candidates(request: MoveRequest, current_user: dict = Depends(get_current_user)):
+    """Move selected candidates to a specific folder"""
+    
+    # 1. Verify folder exists (unless moving to 'Root')
+    if request.folder_id:
+        folder = await folders_collection.find_one({"_id": ObjectId(request.folder_id), "user_id": current_user["_id"]})
+        if not folder: 
+            raise HTTPException(status_code=404, detail="Target folder not found")
+
+    # 2. Update the candidates
+    result = await collection.update_many(
+        {
+            "_id": {"$in": [ObjectId(cid) for cid in request.candidate_ids]}, 
+            "uploaded_by": current_user["username"]
+        },
+        {"$set": {"folder_id": request.folder_id}}
+    )
+    
+    return {"status": "success", "modified": result.modified_count}
+
+# --- UPDATED CV ENDPOINTS ---
+
 @app.post("/upload-cv")
 async def upload_cv(
     background_tasks: BackgroundTasks, 
     files: List[UploadFile] = File(...),
+    folder_id: str = Form(None), # <--- ACCEPT FOLDER ID
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -509,9 +597,6 @@ async def upload_cv(
             detail=f"Your credit balance is too low to upload {cost} files. Please top up your account to continue."
         )
 
-    # Deduct credits
-    # await users_collection.update_one({"_id": current_user["_id"]}, {"$inc": {"current_credits": -cost}})
-
     # Deduct credits AND increment lifetime upload counter
     await users_collection.update_one(
         {"_id": current_user["_id"]}, 
@@ -522,6 +607,11 @@ async def upload_cv(
         "user_id": current_user["_id"], "amount": -cost, "type": "SPEND",
         "description": f"Uploaded {cost} CV(s)", "created_at": datetime.now().isoformat(), "status": "COMPLETED"
     })
+
+    # Validate folder_id
+    final_folder_id = None
+    if folder_id and folder_id != "all" and folder_id != "null":
+        final_folder_id = folder_id
 
     for file in files:
         try:
@@ -540,7 +630,8 @@ async def upload_cv(
                 "Name": "Processing...", "Tel": "...", "Location": "...", "School": "...", 
                 "Experience": "AI is analyzing...", "Gender": "...", "BirthDate": "...", "Position": "...",
                 "file_name": file.filename, "cv_url": cv_url, "upload_date": datetime.now().isoformat(),
-                "locked": False, "status": "Processing", "uploaded_by": current_user["username"]
+                "locked": False, "status": "Processing", "uploaded_by": current_user["username"],
+                "folder_id": final_folder_id # <--- STORE FOLDER ID
             }
             
             insert_result = await collection.insert_one(placeholder_data)
@@ -564,19 +655,38 @@ async def get_candidates(
     page: int = Query(1, ge=1), 
     limit: int = Query(20, le=100), 
     search: str = Query(None),
+    folder_id: str = Query(None), # <--- NEW QUERY PARAM
     current_user: dict = Depends(get_current_user)
 ):
     query_filter = {"uploaded_by": current_user["username"]}
+    
+    # Filter by Folder
+    if folder_id and folder_id != "all":
+        query_filter["folder_id"] = folder_id
+
     if search:
-        search_regex = {"$regex": search, "$options": "i"}
-        # --- FIX: Added {"Position": search_regex} to the list below ---
+        # A. Standard Text Search
+        text_regex = {"$regex": search, "$options": "i"}
+
+        # B. Smart Phone Search (FIXED)
+        clean_digits = re.sub(r'[^0-9]', '', search)
+        
+        if clean_digits:
+            # Added 'r' prefix to make it a raw string
+            phone_pattern = r"[\s\-\.]*".join(list(clean_digits))
+            phone_regex = {"$regex": phone_pattern, "$options": "i"}
+        else:
+            phone_regex = text_regex
+
+        # C. Apply Filters
         query_filter["$and"] = [{
             "$or": [
-                {"Name": search_regex}, 
-                {"Tel": search_regex}, 
-                {"School": search_regex}, 
-                {"Location": search_regex},
-                {"Position": search_regex} 
+                {"Name": text_regex}, 
+                {"Tel": phone_regex},      
+                {"Tel": text_regex},       
+                {"School": text_regex}, 
+                {"Location": text_regex},
+                {"Position": text_regex} 
             ]
         }]
 
@@ -903,7 +1013,7 @@ async def get_pending_transactions(current_user: dict = Depends(get_current_user
 @app.post("/admin/process-transaction/{transaction_id}")
 async def process_transaction(
     transaction_id: str, 
-    action: str = Query(..., regex="^(APPROVE|REJECT)$"),
+    action: str = Query(..., pattern="^(APPROVE|REJECT)$"),
     current_user: dict = Depends(get_current_user)
 ):
     trx = await transactions_collection.find_one({"_id": ObjectId(transaction_id)})
