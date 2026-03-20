@@ -75,7 +75,7 @@ transactions_collection = db["transactions"]
 folders_collection = db["folders"]
 
 # Payment Setup
-BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NjQ5NTIyNDksImV4cCI6MTc3MjcyODI0OX0.tbhgtVlzNrTGhD0mKkN33BgopmENupueM7qa9DsDxOI"
+BAKONG_DEV_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiZmU2MzNjNDdlOGZlNDQ0YSJ9LCJpYXQiOjE3NzQwMDg1NzAsImV4cCI6MTc4MTc4NDU3MH0.OhIuI2tl-9OVfuKKz3gZvNIPHpYc-02_JJxI-w3EeJ0"
 BAKONG_ACCOUNT_ID = "say_vathanak@aclb"
 MERCHANT_NAME = "SAY SAKSOVATHANAK"
 MERCHANT_CITY = "Phnom Penh"
