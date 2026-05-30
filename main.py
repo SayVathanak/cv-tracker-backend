@@ -746,7 +746,7 @@ async def get_pending_transactions(current_user: dict = Depends(get_current_user
     results = []
     async for trx in cursor:
         user = await users_collection.find_one({"_id": trx["user_id"]})
-        results.append({"id": str(trx["_id"]), "username": user.get("username", "Unknown"), "amount": trx["amount"], "payment_ref": trx.get("payment_ref"), "proof_url": trx.get("proof_url"), "submitted_at": trx.get("submitted_at"), "md5_hash": trx.get("md5_hash")})
+        results.append({"id": str(trx["_id"]), "username": user.get("username", "Unknown"), "amount": trx["amount"],"price": trx.get("price", 0), "payment_ref": trx.get("payment_ref"), "proof_url": trx.get("proof_url"), "submitted_at": trx.get("submitted_at"), "md5_hash": trx.get("md5_hash")})
     return results
 
 @app.post("/admin/process-transaction/{transaction_id}")
